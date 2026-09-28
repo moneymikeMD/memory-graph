@@ -15,6 +15,7 @@ import { Config, TOOL_PROFILES, type BackendType } from "./config.ts";
 import { BackendFactory } from "./backends/factory.ts";
 import { MemoryDatabase, CloudMemoryDatabase, type IMemoryDatabase } from "./database.ts";
 import { CloudRESTAdapter } from "./backends/cloud.ts";
+import type { PostgresBackend } from "./backends/postgres.ts";
 
 import { handleStoreMemory, handleGetMemory, handleUpdateMemory, handleDeleteMemory } from "./tools/memory.ts";
 import { handleSearchMemories, handleRecallMemories, handleContextualSearch } from "./tools/search.ts";
@@ -270,11 +271,12 @@ COMMANDS:
   export      Export memories to JSON or Markdown
   import      Import memories from JSON
   migrate     Migrate memories between backends
+  reindex     Embed memories that have no vector (postgres backend)
   health      Run a health check
   config      Show current configuration
 
 GLOBAL OPTIONS:
-  --backend <type>    Backend: falkordblite (default), sqlite, falkordb, memgraph, cloud
+  --backend <type>    Backend: falkordblite (default), sqlite, falkordb, memgraph, postgres, cloud
   --profile <type>    Tool profile: core (default) or extended
   --store <dir>       Store directory (default: ./.memorygraph/ in cwd). Alias: --db-path
   --db-path <dir>     Alias for --store <dir>
@@ -295,13 +297,23 @@ EXAMPLES:
   memorygraph visualize
 
 ENVIRONMENT VARIABLES:
-  MEMORY_BACKEND              Backend type (falkordblite|sqlite|falkordb|memgraph|cloud) [default: falkordblite]
+  MEMORY_BACKEND              Backend type (falkordblite|sqlite|falkordb|memgraph|postgres|cloud) [default: falkordblite]
   MEMORY_STORE_PATH           Store directory (used by --store / --db-path) [default: ./.memorygraph/]
   MEMORY_FALKORDBLITE_PATH    FalkorDBLite database path (overrides --store) [default: <STORE_PATH>/falkordblite.db]
   MEMORY_FALKORDB_HOST        FalkorDB server host [default: localhost]
   MEMORY_FALKORDB_PORT        FalkorDB server port [default: 6379]
   MEMORY_MEMGRAPH_URI         Memgraph Bolt URI [default: bolt://localhost:7687]
   MEMORY_SQLITE_PATH          SQLite database path (overrides --store) [default: <STORE_PATH>/memory.db]
+  MEMORY_POSTGRES_URL         Postgres URL (postgres backend); or the HOST/PORT/DB/USER vars below
+  MEMORY_POSTGRES_HOST        Postgres host [default: localhost]
+  MEMORY_POSTGRES_PORT        Postgres port [default: 5432]
+  MEMORY_POSTGRES_DB          Postgres database [default: memorygraph]
+  MEMORY_POSTGRES_USER        Postgres user [default: memorygraph]
+  MEMORY_POSTGRES_PASSWORD    Postgres password (env only, never a flag)
+  MEMORY_EMBED_URL            Ollama URL for postgres embeddings; unset means full-text only
+  MEMORY_EMBED_MODEL          Embedding model [default: qwen3-embedding:0.6b]
+  MEMORY_EMBED_DIGEST         Expected model digest, verified against /api/tags before embedding
+  MEMORY_DUPLICATE_THRESHOLD  Cosine at which store warns of a possible duplicate [default: 0.8]
   MEMORYGRAPH_API_KEY         API key for cloud backend
   MEMORYGRAPH_API_URL         Cloud API URL [default: https://graph-api.memorygraph.dev]
   MEMORY_TOOL_PROFILE         Tool profile (core|extended) [default: core]
@@ -515,6 +527,9 @@ export async function main(): Promise<void> {
       case "migrate":
         await cmdMigrate(commandArgs);
         break;
+      case "reindex":
+        await cmdReindex(commandArgs);
+        break;
       case "health":
         await cmdHealth(commandArgs);
         break;
@@ -665,6 +680,8 @@ async function cmdStore(args: string[]): Promise<void> {
   }
 
   const { db, close } = await createDb();
+  const backend = (db as MemoryDatabase).backend as unknown as Partial<PostgresBackend> | undefined;
+  if (backend && "duplicateCheck" in backend) backend.duplicateCheck = true;
   try {
     const toolArgs: Record<string, unknown> = {
       type: parsed["type"],
@@ -677,6 +694,12 @@ async function cmdStore(args: string[]): Promise<void> {
 
     const result = await handleStoreMemory(db, toolArgs);
     console.log(result.text);
+    const dup = backend?.lastDuplicate;
+    if (!result.isError && dup) {
+      eprint(
+        `memorygraph: possible duplicate of ${dup.id} "${dup.title}" (cosine ${dup.similarity.toFixed(3)}); stored anyway`
+      );
+    }
     if (result.isError) throw new ExitError(1);
   } finally {
     await close();
@@ -1038,29 +1061,37 @@ async function cmdChanges(args: string[]): Promise<void> {
 
 async function cmdMigrate(args: string[]): Promise<void> {
   const parsed = parseSimpleArgs(args);
-  const targetBackend = parsed["to"] as string;
+  const sourceBackend = typeof parsed["from"] === "string" ? (parsed["from"] as string) : undefined;
+  const targetBackend = typeof parsed["to"] === "string" ? (parsed["to"] as string) : undefined;
   const targetPath = parsed["to-path"] as string | undefined;
   const targetUri = parsed["to-uri"] as string | undefined;
   const dryRun = parsed["dry-run"] === true;
   const noVerify = parsed["no-verify"] === true;
 
-  if (!targetBackend) {
+  if (!targetBackend && !sourceBackend) {
     console.error(
       "Usage: memorygraph migrate --to <backend> [--to-path <path>] [--to-uri <uri>] [--dry-run] [--no-verify]"
     );
-    console.error("  Backends: sqlite, falkordblite, cloud, falkordb");
+    console.error(
+      "       memorygraph migrate --from <backend> [--dry-run] [--no-verify]   (into the configured MEMORY_BACKEND)"
+    );
+    console.error("  Backends: sqlite, falkordblite, cloud, falkordb, memgraph, postgres");
     process.exit(1);
   }
 
-  const sourceConfig = backendConfigFromEnv();
-  const targetConfig: BackendConfig = {
-    backend_type: targetBackend as any,
-    path: targetPath,
-    uri: targetUri,
-    password: targetBackend !== "cloud" ? undefined : undefined,
-    api_key: targetBackend === "cloud" ? Config.MEMORYGRAPH_API_KEY : undefined,
-    api_url: targetBackend === "cloud" ? Config.MEMORYGRAPH_API_URL : undefined,
-  };
+  const sourceConfig = sourceBackend
+    ? backendConfigFromEnv(sourceBackend as BackendType)
+    : backendConfigFromEnv();
+  const targetConfig: BackendConfig = targetBackend
+    ? {
+        ...(targetPath || targetUri ? {} : backendConfigFromEnv(targetBackend as BackendType)),
+        backend_type: targetBackend as any,
+        ...(targetPath ? { path: targetPath } : {}),
+        ...(targetUri ? { uri: targetUri } : {}),
+        api_key: targetBackend === "cloud" ? Config.MEMORYGRAPH_API_KEY : undefined,
+        api_url: targetBackend === "cloud" ? Config.MEMORYGRAPH_API_URL : undefined,
+      }
+    : backendConfigFromEnv();
 
   const options = createMigrationOptions({
     dry_run: dryRun,
@@ -1068,7 +1099,7 @@ async function cmdMigrate(args: string[]): Promise<void> {
     verify: !noVerify,
   });
 
-  eprint(`\nMigrating: ${sourceConfig.backend_type} -> ${targetBackend}`);
+  eprint(`\nMigrating: ${sourceConfig.backend_type} -> ${targetConfig.backend_type}`);
 
   const manager = new MigrationManager();
   const result = await manager.migrate(sourceConfig, targetConfig, options);
@@ -1093,6 +1124,29 @@ async function cmdMigrate(args: string[]): Promise<void> {
       eprint(`   - ${error}`);
     }
     process.exit(1);
+  }
+}
+
+async function cmdReindex(args: string[]): Promise<void> {
+  const parsed = parseSimpleArgs(args);
+  const { db, close } = await createDb();
+  try {
+    const backend = (db as MemoryDatabase).backend as unknown as Partial<PostgresBackend>;
+    if (typeof backend.reindex !== "function") {
+      console.log("'reindex' is only supported on the postgres backend.");
+      return;
+    }
+    const result = await backend.reindex({
+      all: parsed["all"] === true,
+      batchSize: parseIntArg(parsed["batch-size"]),
+    });
+    console.log(`Embedded ${result.embedded} memories; ${result.remaining} still without an embedding.`);
+    if (result.error) {
+      eprint(`memorygraph: reindex stopped: ${result.error}`);
+      throw new ExitError(1);
+    }
+  } finally {
+    await close();
   }
 }
 

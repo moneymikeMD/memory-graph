@@ -11,7 +11,7 @@ import type { GraphBackend, HealthCheckResult } from "./index.ts";
 import type { Memory, Relationship, RelationshipProperties, SearchQuery } from "../models.ts";
 
 const VALID_BACKENDS =
-  "neo4j, memgraph, falkordb, falkordblite, sqlite, turso, ladybugdb, cloud, auto";
+  "neo4j, memgraph, falkordb, falkordblite, sqlite, postgres, turso, ladybugdb, cloud, auto";
 
 const BACKEND_NAMES: Record<string, string> = {
   neo4j: "Neo4j",
@@ -22,6 +22,7 @@ const BACKEND_NAMES: Record<string, string> = {
   turso: "Turso",
   cloud: "Cloud (MemoryGraph Cloud)",
   ladybugdb: "LadybugDB",
+  postgres: "Postgres",
 };
 
 export class BackendFactory {
@@ -68,6 +69,8 @@ export class BackendFactory {
         return BackendFactory.createNeo4j();
       case "memgraph":
         return BackendFactory.createMemgraph();
+      case "postgres":
+        return BackendFactory.createPostgres();
       case "turso":
         return BackendFactory.createTurso();
       case "ladybugdb":
@@ -175,6 +178,14 @@ export class BackendFactory {
     return backend;
   }
 
+  static async createPostgres(url?: string): Promise<GraphBackend> {
+    const { PostgresBackend } = await import("./postgres.ts");
+    const backend = new PostgresBackend(url ? { url } : {});
+    await backend.connect();
+    await backend.initializeSchema();
+    return backend;
+  }
+
   static async createTurso(): Promise<GraphBackend> {
     throw new DatabaseConnectionError(
       "Turso backend not yet implemented in TypeScript port. Use --backend falkordblite or --backend sqlite."
@@ -201,6 +212,7 @@ export class BackendFactory {
       turso: () => Config.isEnvSet("TURSO_DATABASE_URL") || Config.isEnvSet("TURSO_PATH"),
       cloud: () => Config.isEnvSet("MEMORYGRAPH_API_KEY"),
       ladybugdb: () => true,
+      postgres: () => Config.isEnvSet("POSTGRES_URL"),
     };
     const check = checks[backendType];
     return check ? check() : false;

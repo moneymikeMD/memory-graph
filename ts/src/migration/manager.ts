@@ -411,6 +411,13 @@ export class MigrationManager {
             config.password
           );
         }
+        case "postgres": {
+          const { PostgresBackend } = await import("../backends/postgres.ts");
+          const backend = new PostgresBackend({ url: config.uri, password: config.password });
+          await backend.connect();
+          await backend.initializeSchema();
+          return backend;
+        }
         default:
           throw new MigrationError(
             `Backend type ${config.backend_type} not yet supported for migration`
