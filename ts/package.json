@@ -11,6 +11,7 @@
     "dev": "bun run src/cli.ts",
     "build": "bun build src/cli.ts --compile --outfile memorygraph",
     "test": "bun test",
+    "test:postgres": "MEMORYGRAPH_REQUIRE_POSTGRES_TESTS=1 bun test",
     "typecheck": "tsc --noEmit",
     "postinstall": "node scripts/vendor-postinstall.cjs"
   },
@@ -18,6 +19,7 @@
     "falkordb": "^6.0.0",
     "falkordblite": "^0.1.0",
     "neo4j-driver": "^6.2.0",
+    "postgres": "3.4.9",
     "zod": "^3.23.0"
   },
   "devDependencies": {

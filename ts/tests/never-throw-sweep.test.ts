@@ -104,8 +104,16 @@ function stripDebugLogBlock(text: string): string {
 
 function runCli(name: string, args: string[]): { code: number; stdout: string; stderr: string } {
   const dir = mkdtempSync(join(tmpdir(), `mg-sweep-${name}-${Date.now()}-`));
+  // migrate builds its source from MEMORY_* env rather than the injected backend,
+  // so a caller's production MEMORY_* settings must never reach the child.
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.startsWith("MEMORY_"))
+  );
   const env = {
-    ...process.env,
+    ...inherited,
+    MEMORY_BACKEND: "falkordblite",
+    MEMORY_FALKORDB_HOST: "127.0.0.1",
+    MEMORY_FALKORDB_PORT: "1",
     MEMORYGRAPH_TEST_INJECT_THROW: "1",
     MEMORY_FALKORDBLITE_PATH: join(dir, "falkordblite.db"),
     MEMORY_SQLITE_PATH: join(dir, "sqlite.db"),

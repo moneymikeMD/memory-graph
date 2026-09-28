@@ -17,3 +17,5 @@ export {
   CircuitBreakerOpenError,
 } from "./cloud.ts";
 export { SQLiteBackend } from "./sqlite.ts";
+export { PostgresBackend } from "./postgres.ts";
+export { OllamaEmbedder, EmbedderUnavailableError } from "./postgres-embedder.ts";

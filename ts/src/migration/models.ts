@@ -18,8 +18,8 @@ export interface BackendConfig {
   api_key?: string;
 }
 
-export function backendConfigFromEnv(): BackendConfig {
-  const backendType = Config.getBackendType();
+export function backendConfigFromEnv(type?: BackendType): BackendConfig {
+  const backendType = type ?? Config.getBackendType();
   let uri: string | undefined;
   let username: string | undefined;
   let password: string | undefined;
@@ -36,6 +36,11 @@ export function backendConfigFromEnv(): BackendConfig {
   } else if (backendType === "falkordb") {
     uri = `redis://${Config.FALKORDB_HOST}:${Config.FALKORDB_PORT}`;
     password = Config.FALKORDB_PASSWORD;
+  } else if (backendType === "postgres") {
+    uri =
+      Config.POSTGRES_URL ??
+      `postgres://${encodeURIComponent(Config.POSTGRES_USER)}@${Config.POSTGRES_HOST}:${Config.POSTGRES_PORT}/${encodeURIComponent(Config.POSTGRES_DB)}`;
+    password = Config.POSTGRES_PASSWORD;
   } else if (backendType === "sqlite") {
     path = Config.SQLITE_PATH;
   } else if (backendType === "falkordblite") {
@@ -67,7 +72,8 @@ export function validateBackendConfig(config: BackendConfig): string[] {
   } else if (
     config.backend_type === "neo4j" ||
     config.backend_type === "memgraph" ||
-    config.backend_type === "falkordb"
+    config.backend_type === "falkordb" ||
+    config.backend_type === "postgres"
   ) {
     if (!config.uri) {
       errors.push(`${config.backend_type} backend requires 'uri' parameter`);

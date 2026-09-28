@@ -47,6 +47,7 @@ export type BackendType =
   | "falkordb"
   | "falkordblite"
   | "ladybugdb"
+  | "postgres"
   | "auto";
 
 export const ALL_BACKEND_TYPES: BackendType[] = [
@@ -58,6 +59,7 @@ export const ALL_BACKEND_TYPES: BackendType[] = [
   "falkordb",
   "falkordblite",
   "ladybugdb",
+  "postgres",
   "auto",
 ];
 
@@ -228,6 +230,44 @@ export class Config {
   // Bounded query timeout (ms) — enforced at the BaseFalkorDBBackend and
   // BaseBoltBackend executeQuery choke points so a hung query degrades to a
   // typed TimeoutError instead of hanging the caller. Default 5000ms.
+  static get POSTGRES_URL(): string | undefined {
+    return env(["MEMORY_POSTGRES_URL"]);
+  }
+  static get POSTGRES_HOST(): string {
+    return envStr(["MEMORY_POSTGRES_HOST"], "localhost");
+  }
+  static get POSTGRES_PORT(): number {
+    return envInt(["MEMORY_POSTGRES_PORT"], 5432);
+  }
+  static get POSTGRES_DB(): string {
+    return envStr(["MEMORY_POSTGRES_DB"], "memorygraph");
+  }
+  static get POSTGRES_USER(): string {
+    return envStr(["MEMORY_POSTGRES_USER"], "memorygraph");
+  }
+  static get POSTGRES_PASSWORD(): string | undefined {
+    return env(["MEMORY_POSTGRES_PASSWORD"]);
+  }
+
+  static get EMBED_URL(): string | undefined {
+    return env(["MEMORY_EMBED_URL"]);
+  }
+  static get EMBED_MODEL(): string | undefined {
+    return env(["MEMORY_EMBED_MODEL"]);
+  }
+  static get EMBED_DIGEST(): string | undefined {
+    return env(["MEMORY_EMBED_DIGEST"]);
+  }
+  static get EMBED_TIMEOUT_MS(): number {
+    return envInt(["MEMORY_EMBED_TIMEOUT_MS"], 30000);
+  }
+  static get DUPLICATE_THRESHOLD(): number | undefined {
+    const raw = env(["MEMORY_DUPLICATE_THRESHOLD"]);
+    if (raw === undefined) return undefined;
+    const n = Number.parseFloat(raw);
+    return Number.isNaN(n) ? undefined : n;
+  }
+
   static get QUERY_TIMEOUT(): number {
     return envInt(["MEMORYGRAPH_QUERY_TIMEOUT"], 5000);
   }
@@ -312,6 +352,7 @@ export class Config {
       MEMORYGRAPH_API_KEY: ["MEMORYGRAPH_API_KEY"],
       TURSO_DATABASE_URL: ["TURSO_DATABASE_URL"],
       TURSO_PATH: ["MEMORY_TURSO_PATH"],
+      POSTGRES_URL: ["MEMORY_POSTGRES_URL", "MEMORY_POSTGRES_HOST"],
     };
     const names = envMap[attrName];
     if (names) return envIsSet(names);
@@ -376,6 +417,15 @@ export class Config {
         password_configured: !!Config.FALKORDB_PASSWORD,
       },
       falkordblite: { path: Config.FALKORDBLITE_PATH },
+      postgres: {
+        url_configured: !!Config.POSTGRES_URL,
+        host: Config.POSTGRES_HOST,
+        port: Config.POSTGRES_PORT,
+        database: Config.POSTGRES_DB,
+        user: Config.POSTGRES_USER,
+        password_configured: !!Config.POSTGRES_PASSWORD,
+        embed_url: Config.EMBED_URL,
+      },
       logging: { level: Config.LOG_LEVEL },
       features: {
         auto_extract_entities: Config.AUTO_EXTRACT_ENTITIES,

@@ -23,6 +23,11 @@ const _handleGetMemoryStatistics = handleToolErrors(
 
     let text = "**Memory Database Statistics**\n\n";
 
+    const backend = stats["backend"] as Record<string, unknown> | undefined;
+    if (backend) {
+      text += `Backend: ${backend["name"]} (${backend["host"]})\n`;
+    }
+
     const totalMemories = stats["total_memories"] as Record<string, unknown> | undefined;
     if (totalMemories) {
       text += `Total Memories: ${totalMemories["count"]}\n`;
@@ -49,6 +54,16 @@ const _handleGetMemoryStatistics = handleToolErrors(
     const avgConf = stats["avg_confidence"] as Record<string, number> | undefined;
     if (avgConf) {
       text += `Average Confidence: ${avgConf["avg_confidence"]?.toFixed(2)}\n`;
+    }
+
+    const embeddings = stats["embeddings"] as Record<string, unknown> | undefined;
+    if (embeddings) {
+      text += `Embeddings: ${embeddings["embedded"]} embedded, ${embeddings["missing"]} missing (${embeddings["model"]})\n`;
+    }
+
+    const dupEvents = stats["duplicate_events"] as Record<string, unknown> | undefined;
+    if (dupEvents) {
+      text += `Duplicate warnings logged: ${dupEvents["count"]}\n`;
     }
 
     return text;
