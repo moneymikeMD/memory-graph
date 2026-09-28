@@ -1082,14 +1082,16 @@ async function cmdMigrate(args: string[]): Promise<void> {
   const sourceConfig = sourceBackend
     ? backendConfigFromEnv(sourceBackend as BackendType)
     : backendConfigFromEnv();
-  // A postgres target takes its password from MEMORY_POSTGRES_PASSWORD, never argv.
-  const postgresTarget = targetBackend === "postgres" ? backendConfigFromEnv("postgres") : undefined;
+  // Without --to-path/--to-uri the target's settings come from the environment;
+  // a postgres target always takes its password from MEMORY_POSTGRES_PASSWORD, never argv.
+  const envTarget = targetBackend ? backendConfigFromEnv(targetBackend as BackendType) : undefined;
   const targetConfig: BackendConfig = targetBackend
     ? {
+        ...(targetPath || targetUri ? {} : envTarget),
         backend_type: targetBackend as any,
-        path: targetPath,
-        uri: targetUri ?? postgresTarget?.uri,
-        password: postgresTarget?.password,
+        ...(targetPath ? { path: targetPath } : {}),
+        ...(targetUri ? { uri: targetUri } : {}),
+        ...(targetBackend === "postgres" ? { password: envTarget?.password } : {}),
         api_key: targetBackend === "cloud" ? Config.MEMORYGRAPH_API_KEY : undefined,
         api_url: targetBackend === "cloud" ? Config.MEMORYGRAPH_API_URL : undefined,
       }

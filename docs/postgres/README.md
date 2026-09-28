@@ -75,12 +75,14 @@ When the query cannot be embedded, recall uses the full-text arm alone and
 says so once on stderr: `recall is full-text only: the query could not be
 embedded (<reason>)`.
 
-### Differences from the benchmark adapter
+### Deviations
 
-The benchmark adapter is homelab `scripts/bench/memory/adapters/postgres_hybrid`.
-This backend differs from it in five ways:
+The first five items are differences from the benchmark adapter (homelab
+`scripts/bench/memory/adapters/postgres_hybrid`). The last is a difference
+from upstream memorygraph's `migrate`. Items marked *owner-acknowledged* were
+reviewed and kept by the owner on 2026-09-28.
 
-- **The query is lower-cased before it is embedded.** The benchmark embedded
+- **The query is lower-cased before it is embedded** (*owner-acknowledged*). The benchmark embedded
   the raw query and measured recall as unchanged by case. Full-text alone
   already returns the same set for either case, because `to_tsquery`
   lower-cases, but the vector arm does not, so the fused order could differ.
@@ -109,6 +111,16 @@ This backend differs from it in five ways:
   independent of which arm returned a row first. In the spec review, on 400
   proxy queries, the top-5 set differed from the benchmark's on 5 and the
   order on 32.
+- **`migrate --to <backend>` falls back to the environment**
+  (*owner-acknowledged*). Upstream builds the target from the flags alone.
+  Here, when neither `--to-path` nor `--to-uri` is given, the target's
+  settings come from the environment, the same way the source's do. For
+  example, `--to sqlite` uses `MEMORY_SQLITE_PATH` or the default store path.
+  A postgres target always takes its password from
+  `MEMORY_POSTGRES_PASSWORD`, even when `--to-uri` is given, so the password
+  never goes on the command line. The `migrate` case in `never-throw-sweep`
+  is sealed to loopback, because this fallback lets a dry run get as far as
+  exporting from the source (see Testing).
 
 ## Duplicate warning
 
@@ -186,10 +198,8 @@ uses the existing export, import and verify path: it counts both sides and
 compares a sample of 10 memories' content, and it rolls back on a mismatch.
 Each imported memory is embedded as it is written. The verify step requires
 equal counts, so the target must start empty. `--dry-run` validates both ends
-and exports without writing. `--to <backend>` behaves as before. The one
-exception is `--to postgres`: it takes its URL from `MEMORY_POSTGRES_*` when
-`--to-uri` is absent, and it always takes its password from
-`MEMORY_POSTGRES_PASSWORD`, so the password never goes on the command line.
+and exports without writing. With `--to <backend>` and no `--to-path` or
+`--to-uri`, the target's settings come from the environment (see Deviations).
 
 ## Testing
 
