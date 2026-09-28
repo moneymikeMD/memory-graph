@@ -11,6 +11,7 @@
     "dev": "bun run src/cli.ts",
     "build": "bun build src/cli.ts --compile --outfile memorygraph",
     "test": "bun test",
+    "test:postgres": "MEMORYGRAPH_REQUIRE_POSTGRES_TESTS=1 bun test",
     "typecheck": "tsc --noEmit",
     "postinstall": "node scripts/vendor-postinstall.cjs"
   },

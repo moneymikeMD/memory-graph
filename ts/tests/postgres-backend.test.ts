@@ -3,7 +3,8 @@
  * container named by MEMORYGRAPH_TEST_POSTGRES_URL (password from
  * MEMORY_POSTGRES_PASSWORD) and skips when that is unset. Each run creates and
  * drops its own databases; a non-loopback URL fails the suite. Embeddings come
- * from a stub Ollama server on 127.0.0.1.
+ * from a case-sensitive stub Ollama server on 127.0.0.1.
+ * MEMORYGRAPH_REQUIRE_POSTGRES_TESTS=1 (`bun run test:postgres`) turns the skip into a failure.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
@@ -24,6 +25,7 @@ import { exportToJson, importFromJson } from "../src/utils/export-import.ts";
 import { MigrationManager, createMigrationOptions } from "../src/migration/index.ts";
 
 const TEST_URL = process.env.MEMORYGRAPH_TEST_POSTGRES_URL;
+const REQUIRE_SUITE = process.env.MEMORYGRAPH_REQUIRE_POSTGRES_TESTS === "1";
 const PASSWORD = process.env.MEMORY_POSTGRES_PASSWORD;
 const CLI = join(import.meta.dir, "..", "src", "cli.ts");
 const STUB_DIGEST = "stub0000digest";
@@ -31,7 +33,7 @@ const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
 function stubVector(text: string): number[] {
   const vec = new Array<number>(EMBEDDING_DIMENSION).fill(0);
-  for (const token of text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 1)) {
+  for (const token of text.split(/[^A-Za-z0-9]+/).filter((t) => t.length > 1)) {
     const h = createHash("sha1").update(token).digest();
     vec[h.readUInt16BE(0) % EMBEDDING_DIMENSION] += 1;
   }
@@ -39,8 +41,9 @@ function stubVector(text: string): number[] {
   return vec.map((x) => x / norm);
 }
 
-function startStubEmbedder(): Promise<{ server: Server; url: string; calls: () => number }> {
+function startStubEmbedder(): Promise<{ server: Server; url: string; calls: () => number; inputs: string[] }> {
   let calls = 0;
+  const inputs: string[] = [];
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -51,6 +54,7 @@ function startStubEmbedder(): Promise<{ server: Server; url: string; calls: () =
       } else if (req.url === "/api/embed") {
         calls++;
         const input = JSON.parse(body).input as string[];
+        inputs.push(...input);
         res.end(JSON.stringify({ embeddings: input.map(stubVector) }));
       } else {
         res.statusCode = 404;
@@ -61,7 +65,7 @@ function startStubEmbedder(): Promise<{ server: Server; url: string; calls: () =
   return new Promise((resolve) =>
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address() as { port: number };
-      resolve({ server, url: `http://127.0.0.1:${addr.port}`, calls: () => calls });
+      resolve({ server, url: `http://127.0.0.1:${addr.port}`, calls: () => calls, inputs });
     })
   );
 }
@@ -130,6 +134,19 @@ function runCli(args: string[], env: Record<string, string>): Promise<{ code: nu
     child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
   });
 }
+
+if (!TEST_URL) {
+  console.warn(
+    "\n*** SKIPPING the Postgres integration suite: MEMORYGRAPH_TEST_POSTGRES_URL is unset. " +
+      "Set it to a loopback pgvector container, or run `bun run test:postgres` to make this a failure. ***\n"
+  );
+}
+
+describe("postgres suite gate", () => {
+  test.if(REQUIRE_SUITE)("MEMORYGRAPH_TEST_POSTGRES_URL is set when the suite is required", () => {
+    expect(TEST_URL, "MEMORYGRAPH_REQUIRE_POSTGRES_TESTS=1 but MEMORYGRAPH_TEST_POSTGRES_URL is unset").toBeTruthy();
+  });
+});
 
 describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
   let admin: ReturnType<typeof postgres>;
@@ -273,6 +290,9 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     expect(upper.map((m) => m.id)).toEqual(lower.map((m) => m.id));
     expect(upper[0].id).toBe(target);
     expect(upper[0].match_info?.["match_quality"]).toBe("hybrid");
+
+    const sent = stub.inputs.slice(-2);
+    expect(sent).toEqual(["falkordb eviction", "falkordb eviction"]);
 
     for (const nasty of ["lint-cmd && test", "a|b", "foo:bar", "it's", "!(x)", "<->", "\\", "***", "'"]) {
       await backend.recallMemories(nasty, { limit: 3 });

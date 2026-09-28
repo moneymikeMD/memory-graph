@@ -65,25 +65,50 @@ serving a different digest, or returning the wrong dimension:
 ## Recall
 
 1. The full-text arm splits the query into terms. It strips the tsquery
-   operator characters, because to_tsquery rejects them inside a term and the
-   `&&` in `lint-cmd` crashed the LAB-351 bench. It ORs the terms into
-   `to_tsquery('english', …)` and ranks the matches by `ts_rank`. The `english`
-   configuration lower-cases terms, so this arm ignores case.
-2. The vector arm embeds the query and ranks by cosine. It runs with
-   `SET LOCAL hnsw.ef_search` raised to the over-fetch size, because the
-   default of 40 would cap the arm below its 50-row over-fetch.
-3. Both arms over-fetch `max(4 × limit, 50)` rows and are fused by RRF. Ties
-   are broken by id, so results are deterministic.
-
-The query is lower-cased before it is embedded. That makes the whole ranking
-independent of query case: `recall --query 'FALKORDB EVICTION'` returns the
-same ids, in the same order, as the lower-case query. The benchmark embedded
-the raw query and measured recall as unchanged by case. Lower-casing turns
-"recall unchanged" into "identical results".
+   operator characters, ORs the terms into `to_tsquery('english', …)` and
+   ranks the matches by `ts_rank`. The `english` configuration lower-cases
+   terms, so this arm ignores case on its own.
+2. The vector arm embeds the lower-cased query and ranks by cosine.
+3. Both arms over-fetch `max(4 × limit, 50)` rows and are fused by RRF.
 
 When the query cannot be embedded, recall uses the full-text arm alone and
 says so once on stderr: `recall is full-text only: the query could not be
 embedded (<reason>)`.
+
+### Differences from the benchmark adapter
+
+The benchmark adapter is homelab `scripts/bench/memory/adapters/postgres_hybrid`.
+This backend differs from it in five ways:
+
+- **The query is lower-cased before it is embedded.** The benchmark embedded
+  the raw query and measured recall as unchanged by case. Full-text alone
+  already returns the same set for either case, because `to_tsquery`
+  lower-cases, but the vector arm does not, so the fused order could differ.
+  Lower-casing makes `recall --query 'FALKORDB EVICTION'` return the same ids
+  in the same order as the lower-case query. `ts/tests/postgres-backend.test.ts`
+  pins the string sent to `/api/embed`, and its stub embedder is
+  case-sensitive.
+- **`hnsw.ef_search` is raised to the over-fetch size** (`SET LOCAL`, capped
+  at 1000). At the corpus's 1,469 rows the planner does not use the HNSW
+  index: `EXPLAIN` shows Seq Scan plus Sort, which is exact. So the benchmark
+  did not run under the default `ef_search` cap of 40. The raise matters
+  once the index is used on a larger store. With `enable_seqscan = off`, the
+  default returned 40 rows for a `LIMIT 50` (measured 2026-09-28). In the spec
+  review, the top 5 changed on 13 of 400 proxy queries.
+- **The full-text query is capped at 32 terms** (`MAX_QUERY_TERMS`). In the
+  spec review, the measured queries had at most 17 terms, so the cap does not
+  bind on them. It bounds `store`'s duplicate search, which uses the whole
+  title and content as its query.
+- **The tsquery sanitiser is stricter.** The benchmark stripped
+  `& | ! ( ) < > \`, because `to_tsquery` rejects them inside a term and the
+  `&&` in `lint-cmd` crashed the LAB-351 bench. This backend also strips
+  `: * ' " @ ~ ^ { } [ ]` and trims `- . , ; /` from term ends, so no
+  user-supplied text is parsed as tsquery syntax (weights, prefixes, quoting).
+- **RRF ties are broken by id.** The benchmark kept Python's stable sort,
+  which is full-text-first insertion order. The id tie-break makes the order
+  independent of which arm returned a row first. In the spec review, on 400
+  proxy queries, the top-5 set differed from the benchmark's on 5 and the
+  order on 32.
 
 ## Duplicate warning
 
@@ -161,27 +186,33 @@ uses the existing export, import and verify path: it counts both sides and
 compares a sample of 10 memories' content, and it rolls back on a mismatch.
 Each imported memory is embedded as it is written. The verify step requires
 equal counts, so the target must start empty. `--dry-run` validates both ends
-and exports without writing. `--to <backend>` still works as before; with
-`--to`, the target's connection settings now come from the environment unless
-`--to-path` or `--to-uri` is given.
+and exports without writing. `--to <backend>` behaves as before. The one
+exception is `--to postgres`: it takes its URL from `MEMORY_POSTGRES_*` when
+`--to-uri` is absent, and it always takes its password from
+`MEMORY_POSTGRES_PASSWORD`, so the password never goes on the command line.
 
 ## Testing
 
 `ts/tests/postgres-backend.test.ts` runs only when
 `MEMORYGRAPH_TEST_POSTGRES_URL` is set, and it refuses any host that is not
-loopback. Each test creates its own database and drops it afterwards.
-Embeddings come from a stub Ollama server on 127.0.0.1. The suite needs a
-role that can create databases.
+loopback. When the variable is unset, the suite prints a `SKIPPING the
+Postgres integration suite` banner. `bun run test:postgres` sets
+`MEMORYGRAPH_REQUIRE_POSTGRES_TESTS=1`, which turns a missing URL into a
+failing test, so the exit status shows whether the suite ran. Each test
+creates its own database and drops it afterwards. Embeddings come from a
+case-sensitive stub Ollama server on 127.0.0.1. The suite needs a role that
+can create databases.
 
 ```bash
 docker run -d --name mg-pg --env-file pg.env -p 127.0.0.1:55432:5432 \
   pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
 # pg.env: POSTGRES_USER=memorygraph, POSTGRES_DB=memorygraph, POSTGRES_PASSWORD=<generated>
 export MEMORY_POSTGRES_PASSWORD=<same>
-MEMORYGRAPH_TEST_POSTGRES_URL=postgres://memorygraph@127.0.0.1:55432/memorygraph bun test
+MEMORYGRAPH_TEST_POSTGRES_URL=postgres://memorygraph@127.0.0.1:55432/memorygraph bun run test:postgres
 ```
 
 Run the suite with any production `MEMORY_BACKEND` / `MEMORY_FALKORDB_*`
 variables unset. Several existing tests spawn the CLI with the parent
-environment, and `never-throw-sweep`'s `migrate --to sqlite --dry-run` connects
-to whatever FalkorDB `MEMORY_FALKORDB_HOST` names.
+environment and set `MEMORY_BACKEND` themselves. `never-throw-sweep` drops
+every inherited `MEMORY_*` variable and points FalkorDB at 127.0.0.1:1,
+because its `migrate` case builds the migration source from the environment.
