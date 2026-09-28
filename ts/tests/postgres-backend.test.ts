@@ -72,8 +72,8 @@ function dbUrl(name: string): string {
   return u.toString();
 }
 
-function mem(title: string, content: string, extra: Partial<Memory> = {}): Memory {
-  return createMemory({ type: "solution", title, content, ...extra });
+function mem(title: string, content: string, extra: Record<string, unknown> = {}): Memory {
+  return createMemory({ type: "solution", title, content, ...extra } as Parameters<typeof createMemory>[0]);
 }
 
 function query(overrides: Partial<SearchQuery> = {}): SearchQuery {
@@ -162,7 +162,7 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     }
     admin = postgres(TEST_URL!, { password: PASSWORD, onnotice: () => {}, max: 1 });
     stub = await startStubEmbedder();
-  });
+  }, 30_000);
 
   afterAll(async () => {
     await backend?.disconnect();
@@ -171,12 +171,12 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     }
     await admin?.end({ timeout: 5 });
     stub?.server.close();
-  });
+  }, 60_000);
 
   beforeEach(async () => {
     await backend?.disconnect();
     backend = await openBackend(await freshDatabase());
-  });
+  }, 30_000);
 
   test("schema init is idempotent and safe to run concurrently", async () => {
     const url = await freshDatabase();

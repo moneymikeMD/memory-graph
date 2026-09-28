@@ -313,7 +313,7 @@ ENVIRONMENT VARIABLES:
   MEMORY_EMBED_URL            Ollama URL for postgres embeddings; unset means full-text only
   MEMORY_EMBED_MODEL          Embedding model [default: qwen3-embedding:0.6b]
   MEMORY_EMBED_DIGEST         Expected model digest, verified against /api/tags before embedding
-  MEMORY_DUPLICATE_THRESHOLD  Cosine at which store warns of a possible duplicate [default: 0.8]
+  MEMORY_DUPLICATE_THRESHOLD  Cosine at which store warns of a possible duplicate [default: 0.86]
   MEMORYGRAPH_API_KEY         API key for cloud backend
   MEMORYGRAPH_API_URL         Cloud API URL [default: https://graph-api.memorygraph.dev]
   MEMORY_TOOL_PROFILE         Tool profile (core|extended) [default: core]

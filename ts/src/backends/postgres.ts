@@ -36,9 +36,9 @@ import {
 /**
  * Nearest-match cosine at or above which `store` warns of a possible
  * duplicate. Calibrated on the LAB-354 audit corpus; see
- * docs/postgres-backend.md for the method and numbers.
+ * docs/postgres/README.md for the method and numbers.
  */
-export const DEFAULT_DUPLICATE_THRESHOLD = 0.8;
+export const DEFAULT_DUPLICATE_THRESHOLD = 0.86;
 
 const RRF_K = 60;
 const MAX_QUERY_TERMS = 32;
