@@ -217,12 +217,18 @@ can create databases.
 docker run -d --name mg-pg --env-file pg.env -p 127.0.0.1:55432:5432 \
   pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
 # pg.env: POSTGRES_USER=memorygraph, POSTGRES_DB=memorygraph, POSTGRES_PASSWORD=<generated>
-export MEMORY_POSTGRES_PASSWORD=<same>
-MEMORYGRAPH_TEST_POSTGRES_URL=postgres://memorygraph@127.0.0.1:55432/memorygraph bun run test:postgres
+env $(env | awk -F= '/^MEMORY_/{printf "-u %s ", $1}') \
+  MEMORY_POSTGRES_PASSWORD=<same> \
+  MEMORYGRAPH_TEST_POSTGRES_URL=postgres://memorygraph@127.0.0.1:55432/memorygraph \
+  bun run test:postgres
 ```
 
-Run the suite with any production `MEMORY_BACKEND` / `MEMORY_FALKORDB_*`
-variables unset. Several existing tests spawn the CLI with the parent
-environment and set `MEMORY_BACKEND` themselves. `never-throw-sweep` drops
+Run the suite with every inherited `MEMORY_*` variable dropped, not a named
+list. Several tests spawn the CLI with the parent environment and set only
+`MEMORY_BACKEND` themselves. An inherited `MEMORY_FALKORDBLITE_PATH` alone
+fails four `store-path.test.ts` cases (VAL-LOCAL-007, 008 and 009), because
+it overrides `--store` and the cwd-relative default. The `env $(...)` form
+needs a shell that word-splits, such as bash or zsh with the substitution
+unquoted; a zsh `$VAR` holding the list does not split. `never-throw-sweep` drops
 every inherited `MEMORY_*` variable and points FalkorDB at 127.0.0.1:1,
 because its `migrate` case builds the migration source from the environment.
