@@ -569,17 +569,17 @@ export class PostgresBackend implements GraphBackend {
             WHERE from_id = ANY(${frontier}::text[]) OR to_id = ANY(${frontier}::text[])
             ORDER BY strength DESC, id`;
       const frontierSet = new Set(frontier);
-      const next: string[] = [];
+      const layer = new Set<string>();
       for (const link of links) {
         const from = link["from_id"] as string;
         const to = link["to_id"] as string;
-        const other = frontierSet.has(from) && !visited.has(to) ? to : frontierSet.has(to) ? from : null;
-        if (!other || visited.has(other)) continue;
-        visited.add(other);
-        next.push(other);
+        const other = frontierSet.has(from) && !visited.has(to) ? to : frontierSet.has(to) && !visited.has(from) ? from : null;
+        if (!other) continue;
+        layer.add(other);
         reached.push({ id: other, link });
       }
-      frontier = next;
+      for (const id of layer) visited.add(id);
+      frontier = [...layer];
     }
 
     if (reached.length === 0) return [];

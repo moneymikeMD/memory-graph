@@ -280,6 +280,28 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     expect(await backend.deleteMemory(b)).toBe(false);
   });
 
+  test("related returns every edge to a neighbour: two types on one pair, and a pair linked both ways", async () => {
+    const a = await backend.storeMemory(mem("Multi A", "node a"));
+    const b = await backend.storeMemory(mem("Multi B", "node b"));
+    const c = await backend.storeMemory(mem("Multi C", "node c"));
+    await backend.createRelationship(a, b, "CAUSES", { strength: 0.9 } as any);
+    await backend.createRelationship(a, b, "CONTRADICTS", { strength: 0.8 } as any);
+    await backend.createRelationship(a, c, "CAUSES", { strength: 0.7 } as any);
+    await backend.createRelationship(c, a, "CAUSES", { strength: 0.6 } as any);
+
+    const edges = (await backend.getRelatedMemories(a, { maxDepth: 1 })).map(
+      ([m, r]) => `${m.id}:${r.from_memory_id}>${r.to_memory_id}:${r.type}`
+    );
+    expect(edges).toEqual([
+      `${b}:${a}>${b}:CAUSES`,
+      `${b}:${a}>${b}:CONTRADICTS`,
+      `${c}:${a}>${c}:CAUSES`,
+      `${c}:${c}>${a}:CAUSES`,
+    ]);
+    expect((await backend.getRelatedMemories(b, { maxDepth: 1 })).length).toBe(2);
+    expect((await backend.getRelatedMemories(a, { maxDepth: 2 })).length).toBe(4);
+  });
+
   test("recall is hybrid, case-insensitive, and survives tsquery operator characters", async () => {
     const target = await backend.storeMemory(
       mem("FalkorDB eviction under memory pressure", "The falkordb container evicted keys when maxmemory was hit.")
@@ -407,6 +429,42 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
       const result = await importFromJson(new MemoryDatabase(target), file);
       expect(result).toMatchObject({ imported_memories: 2, imported_relationships: 1 });
       expect((await target.getRelatedMemories(a, { maxDepth: 1 })).map(([m]) => m.id)).toEqual([b]);
+      await target.disconnect();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("export then import keeps a second edge on the same pair and both directions of a pair", async () => {
+    const a = await backend.storeMemory(mem("Pair A", "alpha"));
+    const b = await backend.storeMemory(mem("Pair B", "beta"));
+    const c = await backend.storeMemory(mem("Pair C", "gamma"));
+    await backend.createRelationship(a, b, "CAUSES");
+    await backend.createRelationship(a, b, "CONTRADICTS");
+    await backend.createRelationship(a, c, "CAUSES");
+    await backend.createRelationship(c, a, "CAUSES");
+    const triples = async (db: PostgresBackend): Promise<string[]> => {
+      const seen = new Set<string>();
+      for (const id of [a, b, c]) {
+        for (const [, r] of await db.getRelatedMemories(id, { maxDepth: 1 })) {
+          seen.add(`${r.from_memory_id}>${r.to_memory_id}:${r.type}`);
+        }
+      }
+      return [...seen].sort();
+    };
+    const expected = [`${a}>${b}:CAUSES`, `${a}>${b}:CONTRADICTS`, `${a}>${c}:CAUSES`, `${c}>${a}:CAUSES`].sort();
+    expect(await triples(backend)).toEqual(expected);
+
+    const dir = mkdtempSync(join(tmpdir(), "mg-pg-export-pairs-"));
+    try {
+      const file = join(dir, "export.json");
+      const out = await exportToJson(new MemoryDatabase(backend), file);
+      expect(out["relationship_count"]).toBe(4);
+
+      const target = await openBackend(await freshDatabase());
+      const result = await importFromJson(new MemoryDatabase(target), file);
+      expect(result).toMatchObject({ imported_memories: 3, imported_relationships: 4, skipped_relationships: 0 });
+      expect(await triples(target)).toEqual(expected);
       await target.disconnect();
     } finally {
       rmSync(dir, { recursive: true, force: true });
