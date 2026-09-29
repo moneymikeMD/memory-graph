@@ -9,7 +9,9 @@
 export const DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b";
 export const DEFAULT_EMBED_DIGEST =
   "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d";
-export const EMBEDDING_DIMENSION = 1024;
+export const DEFAULT_EMBED_DIMENSION = 1024;
+/** pgvector's HNSW limit for halfvec columns. */
+export const MAX_EMBED_DIMENSION = 4000;
 
 export class EmbedderUnavailableError extends Error {
   constructor(message: string) {
@@ -22,6 +24,7 @@ export interface EmbedderOptions {
   url?: string;
   model?: string;
   digest?: string;
+  dimension?: number;
   timeoutMs?: number;
 }
 
@@ -29,6 +32,7 @@ export class OllamaEmbedder {
   readonly url: string | undefined;
   readonly model: string;
   readonly digest: string;
+  readonly dimension: number;
   readonly timeoutMs: number;
   private verified = false;
   private unavailable: string | null = null;
@@ -37,6 +41,7 @@ export class OllamaEmbedder {
     this.url = opts.url ? opts.url.replace(/\/+$/, "") : undefined;
     this.model = opts.model ?? DEFAULT_EMBED_MODEL;
     this.digest = opts.digest ?? DEFAULT_EMBED_DIGEST;
+    this.dimension = validateDimension(opts.dimension ?? DEFAULT_EMBED_DIMENSION);
     this.timeoutMs = opts.timeoutMs ?? 30000;
     if (!this.url) this.unavailable = "MEMORY_EMBED_URL is not set";
   }
@@ -65,9 +70,9 @@ export class OllamaEmbedder {
         throw new EmbedderUnavailableError("embedder returned no embeddings");
       }
       for (const v of vectors) {
-        if (!Array.isArray(v) || v.length !== EMBEDDING_DIMENSION) {
+        if (!Array.isArray(v) || v.length !== this.dimension) {
           throw new EmbedderUnavailableError(
-            `embedder returned a ${Array.isArray(v) ? v.length : "non-array"}-dimension vector, expected ${EMBEDDING_DIMENSION}`
+            `embedder returned a ${Array.isArray(v) ? v.length : "non-array"}-dimension vector, expected ${this.dimension}`
           );
         }
       }
@@ -120,6 +125,14 @@ export class OllamaEmbedder {
       clearTimeout(timer);
     }
   }
+}
+
+/** Return the dimension if it is an integer pgvector can index as halfvec, else throw. */
+export function validateDimension(dimension: number): number {
+  if (!Number.isInteger(dimension) || dimension < 1 || dimension > MAX_EMBED_DIMENSION) {
+    throw new Error(`MEMORY_EMBED_DIMENSION must be an integer from 1 to ${MAX_EMBED_DIMENSION}, got ${dimension}`);
+  }
+  return dimension;
 }
 
 /** The text a memory is embedded from, matching the LAB-348 benchmark. */

@@ -258,6 +258,10 @@ export class Config {
   static get EMBED_DIGEST(): string | undefined {
     return env(["MEMORY_EMBED_DIGEST"]);
   }
+  static get EMBED_DIMENSION(): number | undefined {
+    const raw = env(["MEMORY_EMBED_DIMENSION"]);
+    return raw === undefined ? undefined : Number(raw);
+  }
   static get EMBED_TIMEOUT_MS(): number {
     return envInt(["MEMORY_EMBED_TIMEOUT_MS"], 30000);
   }

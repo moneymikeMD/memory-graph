@@ -270,7 +270,7 @@ COMMANDS:
   Data Management:
   export      Export memories to JSON or Markdown
   import      Import memories from JSON
-  migrate     Migrate memories between backends
+  migrate     Migrate memories between backends; 'migrate embedding' moves postgres vectors to halfvec
   reindex     Embed memories that have no vector (postgres backend)
   health      Run a health check
   config      Show current configuration
@@ -313,6 +313,7 @@ ENVIRONMENT VARIABLES:
   MEMORY_EMBED_URL            Ollama URL for postgres embeddings; unset means full-text only
   MEMORY_EMBED_MODEL          Embedding model [default: qwen3-embedding:0.6b]
   MEMORY_EMBED_DIGEST         Expected model digest, verified against /api/tags before embedding
+  MEMORY_EMBED_DIMENSION      Embedding dimension; must match the halfvec column [default: 1024]
   MEMORY_DUPLICATE_THRESHOLD  Cosine at which store warns of a possible duplicate [default: 0.86]
   MEMORYGRAPH_API_KEY         API key for cloud backend
   MEMORYGRAPH_API_URL         Cloud API URL [default: https://graph-api.memorygraph.dev]
@@ -1061,6 +1062,10 @@ async function cmdChanges(args: string[]): Promise<void> {
 
 async function cmdMigrate(args: string[]): Promise<void> {
   const parsed = parseSimpleArgs(args);
+  if (((parsed["_positional"] as string[]) ?? [])[0] === "embedding") {
+    await cmdMigrateEmbedding(parsed["dry-run"] === true);
+    return;
+  }
   const sourceBackend = typeof parsed["from"] === "string" ? (parsed["from"] as string) : undefined;
   const targetBackend = typeof parsed["to"] === "string" ? (parsed["to"] as string) : undefined;
   const targetPath = parsed["to-path"] as string | undefined;
@@ -1075,6 +1080,7 @@ async function cmdMigrate(args: string[]): Promise<void> {
     console.error(
       "       memorygraph migrate --from <backend> [--dry-run] [--no-verify]   (into the configured MEMORY_BACKEND)"
     );
+    console.error("       memorygraph migrate embedding [--dry-run]   (postgres: move the embedding column to halfvec)");
     console.error("  Backends: sqlite, falkordblite, cloud, falkordb, memgraph, postgres");
     process.exit(1);
   }
@@ -1128,6 +1134,22 @@ async function cmdMigrate(args: string[]): Promise<void> {
       eprint(`   - ${error}`);
     }
     process.exit(1);
+  }
+}
+
+async function cmdMigrateEmbedding(dryRun: boolean): Promise<void> {
+  if (Config.BACKEND !== "postgres") {
+    eprint("'migrate embedding' is only supported on the postgres backend (MEMORY_BACKEND=postgres).");
+    throw new ExitError(1);
+  }
+  const { PostgresBackend, formatEmbeddingPlan } = await import("./backends/postgres.ts");
+  const backend = new PostgresBackend();
+  await backend.connect();
+  try {
+    const plan = dryRun ? await backend.planEmbeddingMigration() : await backend.migrateEmbedding();
+    console.log(formatEmbeddingPlan(plan, dryRun));
+  } finally {
+    await backend.disconnect();
   }
 }
 

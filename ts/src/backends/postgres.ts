@@ -25,7 +25,6 @@ import {
 import type { GraphBackend, HealthCheckResult } from "./base.ts";
 import { DatabaseConnectionError, RelationshipError, ValidationError } from "../errors.ts";
 import {
-  EMBEDDING_DIMENSION,
   EmbedderUnavailableError,
   OllamaEmbedder,
   memoryEmbedText,
@@ -66,7 +65,29 @@ interface RankedId {
   score: number;
 }
 
+export interface EmbeddingColumn {
+  type: string;
+  dimension: number | null;
+  formatted: string;
+}
+
+/**
+ * What `migrate embedding` does to move memories.embedding to halfvec(N).
+ * `current` is null when the store has no memories table yet.
+ */
+export interface EmbeddingMigrationPlan {
+  current: EmbeddingColumn | null;
+  target: string;
+  action: "none" | "create-index" | "cast" | "retype";
+  memories: number;
+  embedded: number;
+  otherModel: number;
+  model: string;
+  statements: string[];
+}
+
 type Sql = ReturnType<typeof postgres>;
+type Tx = postgres.TransactionSql;
 
 export class PostgresBackend implements GraphBackend {
   readonly embedder: OllamaEmbedder;
@@ -79,6 +100,7 @@ export class PostgresBackend implements GraphBackend {
   private sql: Sql | null = null;
   private connected = false;
   private warnedFulltextOnly = false;
+  private columnType = "halfvec";
 
   constructor(opts: PostgresBackendOptions = {}) {
     this.opts = {
@@ -95,6 +117,7 @@ export class PostgresBackend implements GraphBackend {
         url: Config.EMBED_URL,
         model: Config.EMBED_MODEL,
         digest: Config.EMBED_DIGEST,
+        dimension: Config.EMBED_DIMENSION,
         timeoutMs: Config.EMBED_TIMEOUT_MS,
       });
     this.duplicateThreshold =
@@ -156,11 +179,46 @@ export class PostgresBackend implements GraphBackend {
     this.connected = false;
   }
 
+  /**
+   * Create the schema if absent and check memories.embedding against the
+   * configured dimension. Throws on a mismatch; `migrate embedding` fixes it.
+   */
   async initializeSchema(): Promise<void> {
     const sql = this.db();
-    await sql.begin(async (tx) => {
+    const dimension = this.embedder.dimension;
+    this.columnType = await sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('memorygraph_schema'))`;
-      await tx.unsafe(SCHEMA_SQL);
+      await tx.unsafe(schemaSql(dimension));
+      const column = await readEmbeddingColumn(tx);
+      if (!column || column.dimension !== dimension || (column.type !== "vector" && column.type !== "halfvec")) {
+        throw new DatabaseConnectionError(
+          `memories.embedding is ${column?.formatted ?? "missing"} but MEMORY_EMBED_DIMENSION is ${dimension}; ` +
+            "run 'memorygraph migrate embedding --dry-run' to see the migration plan"
+        );
+      }
+      await tx.unsafe(
+        `CREATE INDEX IF NOT EXISTS ${EMBEDDING_INDEX} ON memories USING hnsw (embedding ${column.type}_cosine_ops)`
+      );
+      return column.type;
+    });
+  }
+
+  /** The migration `migrate embedding` would run, computed in a read-only transaction. */
+  async planEmbeddingMigration(): Promise<EmbeddingMigrationPlan> {
+    return this.db().begin("read only", (tx) => buildEmbeddingPlan(tx, this.embedder.dimension, this.embedder.model));
+  }
+
+  /**
+   * Move memories.embedding to halfvec(N) under the schema lock: cast in
+   * place when N is unchanged, else NULL every vector for `reindex`.
+   * Idempotent; returns the plan it ran.
+   */
+  async migrateEmbedding(): Promise<EmbeddingMigrationPlan> {
+    return this.db().begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('memorygraph_schema'))`;
+      const plan = await buildEmbeddingPlan(tx, this.embedder.dimension, this.embedder.model);
+      for (const statement of plan.statements) await tx.unsafe(statement);
+      return plan;
     });
   }
 
@@ -281,7 +339,7 @@ export class PostgresBackend implements GraphBackend {
           ${row.importance}, ${row.confidence}, ${row.effectiveness}, ${row.usage_count},
           ${row.created_at}, ${row.updated_at}, ${row.last_accessed}, ${row.version},
           ${row.updated_by}, ${row.context},
-          ${vectorParam}::vector, ${vector ? this.embedder.model : null}, ${embedError}
+          ${vectorParam}::${sql.unsafe(this.columnType)}, ${vector ? this.embedder.model : null}, ${embedError}
         )
         ON CONFLICT (id) DO UPDATE SET
           type = EXCLUDED.type,
@@ -327,7 +385,7 @@ export class PostgresBackend implements GraphBackend {
     if (fused.length === 0) return null;
     const ids = fused.map((r) => r.id);
     const rows = await this.db()`
-      SELECT id, title, 1 - (embedding <=> ${vectorLiteral(vector)}::vector) AS similarity
+      SELECT id, title, 1 - (embedding <=> ${vectorLiteral(vector)}::${this.db().unsafe(this.columnType)}) AS similarity
       FROM memories
       WHERE id = ANY(${ids}::text[]) AND embedding IS NOT NULL
       ORDER BY similarity DESC, id
@@ -459,9 +517,9 @@ export class PostgresBackend implements GraphBackend {
     const rows = await this.db().begin(async (tx) => {
       await tx.unsafe(`SET LOCAL hnsw.ef_search = ${efSearch}`);
       return tx.unsafe(
-        `SELECT id, 1 - (embedding <=> $1::vector) AS score
+        `SELECT id, 1 - (embedding <=> $1::${this.columnType}) AS score
          FROM memories WHERE ${where.join(" AND ")}
-         ORDER BY embedding <=> $1::vector, id LIMIT $${params.length}`,
+         ORDER BY embedding <=> $1::${this.columnType}, id LIMIT $${params.length}`,
         params as never[]
       );
     });
@@ -483,7 +541,7 @@ export class PostgresBackend implements GraphBackend {
       const { vectors, error } = await this.tryEmbed([memoryEmbedText(memory.title, memory.content)]);
       const vec = vectors?.[0] ? vectorLiteral(vectors[0]) : null;
       if (error) console.error(`memorygraph: updated ${memory.id} without an embedding (${error}); run 'memorygraph reindex' later`);
-      vectorSql = sql`${vec}::vector`;
+      vectorSql = sql`${vec}::${sql.unsafe(this.columnType)}`;
       modelSql = sql`${vec ? this.embedder.model : null}`;
       errorSql = sql`${error}`;
     }
@@ -713,7 +771,7 @@ export class PostgresBackend implements GraphBackend {
       await sql.begin(async (tx) => {
         for (let i = 0; i < rows.length; i++) {
           await tx`
-            UPDATE memories SET embedding = ${vectorLiteral(result.vectors![i])}::vector,
+            UPDATE memories SET embedding = ${vectorLiteral(result.vectors![i])}::${tx.unsafe(this.columnType)},
               embedding_model = ${this.embedder.model}, embedding_error = NULL
             WHERE id = ${rows[i]["id"] as string}`;
         }
@@ -729,7 +787,9 @@ export class PostgresBackend implements GraphBackend {
 // SQL
 // ---------------------------------------------------------------------------
 
-const SCHEMA_SQL = `
+const EMBEDDING_INDEX = "memories_embedding_hnsw_idx";
+
+const schemaSql = (dimension: number): string => `
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -749,7 +809,7 @@ CREATE TABLE IF NOT EXISTS memories (
   version integer NOT NULL DEFAULT 1,
   updated_by text,
   context jsonb,
-  embedding vector(${EMBEDDING_DIMENSION}),
+  embedding halfvec(${dimension}),
   embedding_model text,
   embedding_error text,
   search_vector tsvector GENERATED ALWAYS AS (
@@ -757,7 +817,6 @@ CREATE TABLE IF NOT EXISTS memories (
   ) STORED
 );
 CREATE INDEX IF NOT EXISTS memories_search_idx ON memories USING GIN (search_vector);
-CREATE INDEX IF NOT EXISTS memories_embedding_hnsw_idx ON memories USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS memories_created_at_idx ON memories (created_at);
 CREATE INDEX IF NOT EXISTS memories_type_idx ON memories (type);
 
@@ -796,6 +855,106 @@ CREATE TABLE IF NOT EXISTS duplicate_events (
 
 const MEMORY_COLUMNS = `id, type, title, content, summary, tags, importance, confidence, effectiveness,
   usage_count, created_at, updated_at, last_accessed, version, updated_by, context`;
+
+// ---------------------------------------------------------------------------
+// Embedding column migration
+// ---------------------------------------------------------------------------
+
+async function readEmbeddingColumn(tx: Tx): Promise<EmbeddingColumn | null> {
+  const [row] = await tx`
+    SELECT t.typname AS type, a.atttypmod AS typmod, format_type(a.atttypid, a.atttypmod) AS formatted
+    FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = to_regclass('memories') AND a.attname = 'embedding' AND NOT a.attisdropped`;
+  if (!row) return null;
+  const typmod = Number(row["typmod"]);
+  return {
+    type: row["type"] as string,
+    dimension: typmod > 0 ? typmod : null,
+    formatted: row["formatted"] as string,
+  };
+}
+
+async function buildEmbeddingPlan(tx: Tx, dimension: number, model: string): Promise<EmbeddingMigrationPlan> {
+  const target = `halfvec(${dimension})`;
+  const plan: EmbeddingMigrationPlan = {
+    current: await readEmbeddingColumn(tx),
+    target,
+    action: "none",
+    memories: 0,
+    embedded: 0,
+    otherModel: 0,
+    model,
+    statements: [],
+  };
+  const current = plan.current;
+  if (!current) return plan;
+  if (current.type !== "vector" && current.type !== "halfvec") {
+    throw new ValidationError(`memories.embedding is ${current.formatted}; migrate embedding handles vector and halfvec only`);
+  }
+
+  const [counts] = await tx`
+    SELECT count(*)::int AS memories, count(embedding)::int AS embedded,
+           (count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM ${model}))::int AS other_model
+    FROM memories`;
+  plan.memories = counts["memories"] as number;
+  plan.embedded = counts["embedded"] as number;
+  plan.otherModel = counts["other_model"] as number;
+
+  const [index] = await tx`
+    SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ${EMBEDDING_INDEX}`;
+  const indexReady = typeof index?.["indexdef"] === "string" && index["indexdef"].includes("halfvec_cosine_ops");
+  const dropIndex = `DROP INDEX IF EXISTS ${EMBEDDING_INDEX}`;
+  const createIndex = `CREATE INDEX ${EMBEDDING_INDEX} ON memories USING hnsw (embedding halfvec_cosine_ops)`;
+
+  if (current.type === "halfvec" && current.dimension === dimension) {
+    if (!indexReady) {
+      plan.action = "create-index";
+      plan.statements = [dropIndex, createIndex];
+    }
+  } else if (current.dimension === dimension) {
+    plan.action = "cast";
+    plan.statements = [
+      dropIndex,
+      `ALTER TABLE memories ALTER COLUMN embedding TYPE ${target} USING embedding::${target}`,
+      createIndex,
+    ];
+  } else {
+    plan.action = "retype";
+    plan.statements = [
+      dropIndex,
+      `ALTER TABLE memories ALTER COLUMN embedding TYPE ${target} USING NULL::${target}`,
+      "UPDATE memories SET embedding_model = NULL, embedding_error = NULL",
+      createIndex,
+    ];
+  }
+  return plan;
+}
+
+/** Human-readable plan for `migrate embedding`, stating whether it ran. */
+export function formatEmbeddingPlan(plan: EmbeddingMigrationPlan, dryRun: boolean): string {
+  if (!plan.current) {
+    return `No memories table yet; the first command creates it with embedding ${plan.target}.`;
+  }
+  const lines = [
+    `Embedding column: ${plan.current.formatted} -> ${plan.target}`,
+    `Memories: ${plan.memories} (${plan.embedded} embedded)`,
+  ];
+  const describe: Record<EmbeddingMigrationPlan["action"], string> = {
+    none: `nothing to do; the column is already ${plan.target} with a halfvec HNSW index`,
+    "create-index": "rebuild the HNSW index with halfvec_cosine_ops",
+    cast: "cast every vector in place and rebuild the HNSW index; vectors are kept",
+    retype: `the dimension changes, so every embedding becomes NULL; run 'memorygraph reindex' afterwards to embed ${plan.memories} memories`,
+  };
+  lines.push(`Action: ${plan.action}: ${describe[plan.action]}`);
+  for (const statement of plan.statements) lines.push(`  ${statement};`);
+  if (plan.otherModel > 0 && plan.action !== "retype") {
+    lines.push(
+      `Note: ${plan.otherModel} memories were embedded with a model other than ${plan.model}; run 'memorygraph reindex --all' to re-embed them.`
+    );
+  }
+  lines.push(dryRun ? "Dry run: nothing was changed." : plan.action === "none" ? "Nothing changed." : "Migrated.");
+  return lines.join("\n");
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
