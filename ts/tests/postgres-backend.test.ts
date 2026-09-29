@@ -16,8 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
 
-import { PostgresBackend, buildTsquery, rrf } from "../src/backends/postgres.ts";
-import { OllamaEmbedder, EMBEDDING_DIMENSION } from "../src/backends/postgres-embedder.ts";
+import { PostgresBackend, buildTsquery, formatEmbeddingPlan, rrf } from "../src/backends/postgres.ts";
+import { OllamaEmbedder, DEFAULT_EMBED_DIMENSION } from "../src/backends/postgres-embedder.ts";
 import { SQLiteBackend } from "../src/backends/sqlite.ts";
 import { MemoryDatabase } from "../src/database.ts";
 import { createMemory, type Memory, type SearchQuery } from "../src/models.ts";
@@ -30,12 +30,14 @@ const PASSWORD = process.env.MEMORY_POSTGRES_PASSWORD;
 const CLI = join(import.meta.dir, "..", "src", "cli.ts");
 const STUB_DIGEST = "stub0000digest";
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const SMALL_MODEL = "stub-embed:64";
+const SMALL_DIMENSION = 64;
 
-function stubVector(text: string): number[] {
-  const vec = new Array<number>(EMBEDDING_DIMENSION).fill(0);
+function stubVector(text: string, dimension = DEFAULT_EMBED_DIMENSION): number[] {
+  const vec = new Array<number>(dimension).fill(0);
   for (const token of text.split(/[^A-Za-z0-9]+/).filter((t) => t.length > 1)) {
     const h = createHash("sha1").update(token).digest();
-    vec[h.readUInt16BE(0) % EMBEDDING_DIMENSION] += 1;
+    vec[h.readUInt16BE(0) % dimension] += 1;
   }
   const norm = Math.sqrt(vec.reduce((s, x) => s + x * x, 0)) || 1;
   return vec.map((x) => x / norm);
@@ -50,12 +52,20 @@ function startStubEmbedder(): Promise<{ server: Server; url: string; calls: () =
     req.on("end", () => {
       res.setHeader("Content-Type", "application/json");
       if (req.url === "/api/tags") {
-        res.end(JSON.stringify({ models: [{ name: "qwen3-embedding:0.6b", digest: STUB_DIGEST }] }));
+        res.end(
+          JSON.stringify({
+            models: [
+              { name: "qwen3-embedding:0.6b", digest: STUB_DIGEST },
+              { name: SMALL_MODEL, digest: STUB_DIGEST },
+            ],
+          })
+        );
       } else if (req.url === "/api/embed") {
         calls++;
-        const input = JSON.parse(body).input as string[];
+        const { input, model } = JSON.parse(body) as { input: string[]; model: string };
         inputs.push(...input);
-        res.end(JSON.stringify({ embeddings: input.map(stubVector) }));
+        const dimension = model === SMALL_MODEL ? SMALL_DIMENSION : DEFAULT_EMBED_DIMENSION;
+        res.end(JSON.stringify({ embeddings: input.map((t) => stubVector(t, dimension)) }));
       } else {
         res.statusCode = 404;
         res.end("{}");
@@ -163,6 +173,68 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
 
   function embedder(url = stub.url, digest = STUB_DIGEST): OllamaEmbedder {
     return new OllamaEmbedder({ url, digest, timeoutMs: 2000 });
+  }
+
+  function smallEmbedder(): OllamaEmbedder {
+    return new OllamaEmbedder({ url: stub.url, digest: STUB_DIGEST, model: SMALL_MODEL, dimension: SMALL_DIMENSION, timeoutMs: 2000 });
+  }
+
+  async function withClient<T>(url: string, fn: (c: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
+    const c = postgres(url, { password: PASSWORD, onnotice: () => {}, max: 1 });
+    try {
+      return await fn(c);
+    } finally {
+      await c.end({ timeout: 5 });
+    }
+  }
+
+  async function embeddingState(url: string): Promise<{ column: string; index: string; embedded: number; models: string[] }> {
+    return withClient(url, async (c) => {
+      const [col] = await c`
+        SELECT format_type(atttypid, atttypmod) AS column FROM pg_attribute
+        WHERE attrelid = 'memories'::regclass AND attname = 'embedding'`;
+      const [idx] = await c`SELECT indexdef FROM pg_indexes WHERE indexname = 'memories_embedding_hnsw_idx'`;
+      const [cnt] = await c`SELECT count(embedding)::int AS embedded FROM memories`;
+      const models = await c`SELECT DISTINCT coalesce(embedding_model, '') AS m FROM memories ORDER BY m`;
+      return {
+        column: col["column"] as string,
+        index: (idx?.["indexdef"] as string) ?? "",
+        embedded: cnt["embedded"] as number,
+        models: models.map((r) => r["m"] as string),
+      };
+    });
+  }
+
+  async function vectorsById(url: string): Promise<Map<string, number[]>> {
+    return withClient(url, async (c) => {
+      const rows = await c`SELECT id, embedding::text AS v FROM memories WHERE embedding IS NOT NULL ORDER BY id`;
+      return new Map(rows.map((r) => [r["id"] as string, JSON.parse(r["v"] as string) as number[]]));
+    });
+  }
+
+  /** Turn a fresh store back into the pre-LAB-388 layout: vector(1024) with a vector_cosine_ops index. */
+  async function makeLegacyVectorStore(url: string): Promise<void> {
+    await withClient(url, (c) =>
+      c.unsafe(`
+        DROP INDEX memories_embedding_hnsw_idx;
+        ALTER TABLE memories ALTER COLUMN embedding TYPE vector(1024) USING embedding::vector(1024);
+        CREATE INDEX memories_embedding_hnsw_idx ON memories USING hnsw (embedding vector_cosine_ops);`)
+    );
+  }
+
+  const CORPUS: Array<[string, string]> = [
+    ["Gluetun port forwarding", "gluetun forwards the vpn port to qbittorrent"],
+    ["FalkorDB eviction policy", "allkeys-lru evicts memories silently under memory pressure"],
+    ["Caddy reverse proxy", "caddy terminates tls for every homelab service"],
+    ["Postgres halfvec index", "pgvector halfvec supports hnsw up to four thousand dimensions"],
+    ["Ollama embedder digest", "the embedder digest is verified against api tags before embedding"],
+  ];
+  const QUERIES = ["vpn port forwarding", "memory eviction", "hnsw dimensions", "tls proxy"];
+
+  async function recallIds(b: PostgresBackend): Promise<string[][]> {
+    const out: string[][] = [];
+    for (const q of QUERIES) out.push((await b.recallMemories(q, { limit: 3 })).map((m) => m.id!));
+    return out;
   }
 
   async function openBackend(url: string, emb = embedder()): Promise<PostgresBackend> {
@@ -372,6 +444,183 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     await wrong.disconnect();
   });
 
+  test("a fresh store creates halfvec(N) with a halfvec_cosine_ops HNSW index", async () => {
+    const url = await freshDatabase();
+    const b = await openBackend(url);
+    await b.storeMemory(mem("Fresh halfvec", "stored into a halfvec column"));
+    await b.disconnect();
+    const state = await embeddingState(url);
+    expect(state.column).toBe("halfvec(1024)");
+    expect(state.index).toContain("halfvec_cosine_ops");
+    expect(state.embedded).toBe(1);
+
+    const smallUrl = await freshDatabase();
+    const small = await openBackend(smallUrl, smallEmbedder());
+    await small.storeMemory(mem("Small halfvec", "a 64 dimension store"));
+    expect((await small.planEmbeddingMigration()).action).toBe("none");
+    await small.disconnect();
+    expect((await embeddingState(smallUrl)).column).toBe(`halfvec(${SMALL_DIMENSION})`);
+  });
+
+  test("recall goes through the halfvec HNSW index", async () => {
+    const url = await freshDatabase();
+    const seeded = await openBackend(url);
+    for (const [title, content] of CORPUS) await seeded.storeMemory(mem(title, content));
+    const expected = await recallIds(seeded);
+    await seeded.disconnect();
+
+    const dbName = new URL(url).pathname.slice(1);
+    await admin.unsafe(`ALTER DATABASE ${dbName} SET enable_seqscan = off`);
+    const indexed = await openBackend(url);
+    expect(await recallIds(indexed)).toEqual(expected);
+    expect((await indexed.recallMemories("vpn port forwarding", { limit: 1 }))[0].title).toBe("Gluetun port forwarding");
+    await indexed.disconnect();
+
+    const plan = await withClient(url, (c) =>
+      c.unsafe(
+        `EXPLAIN SELECT id FROM memories WHERE embedding IS NOT NULL
+         ORDER BY embedding <=> $1::halfvec, id LIMIT 50`,
+        [`[${stubVector("vpn port").join(",")}]`]
+      )
+    );
+    expect(plan.map((r) => r["QUERY PLAN"]).join("\n")).toContain("memories_embedding_hnsw_idx");
+  });
+
+  test("a dimension mismatch at startup fails loudly", async () => {
+    const url = await freshDatabase();
+    const seeded = await openBackend(url);
+    await seeded.storeMemory(mem("Seeded at 1024", "the column is halfvec 1024"));
+    await seeded.disconnect();
+
+    const mismatched = new PostgresBackend({ url, password: PASSWORD, embedder: smallEmbedder() });
+    await mismatched.connect();
+    await expect(mismatched.initializeSchema()).rejects.toThrow(
+      /memories\.embedding is halfvec\(1024\) but MEMORY_EMBED_DIMENSION is 64; run 'memorygraph migrate embedding --dry-run'/
+    );
+    await mismatched.disconnect();
+
+    const cli = await runCli(["stats"], {
+      MEMORY_BACKEND: "postgres",
+      MEMORY_POSTGRES_URL: url,
+      MEMORY_POSTGRES_PASSWORD: PASSWORD ?? "",
+      MEMORY_EMBED_URL: stub.url,
+      MEMORY_EMBED_MODEL: SMALL_MODEL,
+      MEMORY_EMBED_DIGEST: STUB_DIGEST,
+      MEMORY_EMBED_DIMENSION: String(SMALL_DIMENSION),
+    });
+    expect(cli.code).not.toBe(0);
+    expect(cli.stderr).toContain("MEMORY_EMBED_DIMENSION is 64");
+    expect((await embeddingState(url)).column).toBe("halfvec(1024)");
+  }, 30_000);
+
+  test("migrate with the same dimension casts in place, keeping every vector and the recall results", async () => {
+    const url = await freshDatabase();
+    await (await openBackend(url)).disconnect();
+    await makeLegacyVectorStore(url);
+
+    const legacy = await openBackend(url);
+    for (const [title, content] of CORPUS) await legacy.storeMemory(mem(title, content));
+    const before = await recallIds(legacy);
+    const dryRun = await legacy.planEmbeddingMigration();
+    await legacy.disconnect();
+    expect(dryRun.action).toBe("cast");
+    expect(dryRun.current?.formatted).toBe("vector(1024)");
+    expect(dryRun.statements.join(";")).toContain("USING embedding::halfvec(1024)");
+    expect((await embeddingState(url)).column).toBe("vector(1024)");
+    const vectorsBefore = await vectorsById(url);
+    expect(vectorsBefore.size).toBe(CORPUS.length);
+
+    const migrator = new PostgresBackend({ url, password: PASSWORD, embedder: embedder() });
+    await migrator.connect();
+    expect((await migrator.migrateEmbedding()).action).toBe("cast");
+    expect((await migrator.migrateEmbedding()).action).toBe("none");
+    await migrator.disconnect();
+
+    const state = await embeddingState(url);
+    expect(state.column).toBe("halfvec(1024)");
+    expect(state.index).toContain("halfvec_cosine_ops");
+    expect(state.embedded).toBe(CORPUS.length);
+    const vectorsAfter = await vectorsById(url);
+    expect([...vectorsAfter.keys()]).toEqual([...vectorsBefore.keys()]);
+    for (const [id, v] of vectorsBefore) {
+      const w = vectorsAfter.get(id)!;
+      expect(w.length).toBe(v.length);
+      expect(Math.max(...v.map((x, i) => Math.abs(x - w[i])))).toBeLessThan(1e-3);
+    }
+
+    const migrated = await openBackend(url);
+    expect(await recallIds(migrated)).toEqual(before);
+    await migrated.disconnect();
+  }, 30_000);
+
+  test("migrate with a new dimension NULLs embeddings, and reindex refills them", async () => {
+    const url = await freshDatabase();
+    const seeded = await openBackend(url);
+    for (const [title, content] of CORPUS) await seeded.storeMemory(mem(title, content));
+    await seeded.disconnect();
+
+    const migrator = new PostgresBackend({ url, password: PASSWORD, embedder: smallEmbedder() });
+    await migrator.connect();
+    const plan = await migrator.planEmbeddingMigration();
+    expect(plan.action).toBe("retype");
+    expect(plan.embedded).toBe(CORPUS.length);
+    expect((await embeddingState(url)).embedded).toBe(CORPUS.length);
+    expect((await migrator.migrateEmbedding()).action).toBe("retype");
+    expect((await migrator.migrateEmbedding()).action).toBe("none");
+    await migrator.disconnect();
+
+    const nulled = await embeddingState(url);
+    expect(nulled.column).toBe(`halfvec(${SMALL_DIMENSION})`);
+    expect(nulled.index).toContain("halfvec_cosine_ops");
+    expect(nulled.embedded).toBe(0);
+    expect(nulled.models).toEqual([""]);
+
+    const small = await openBackend(url, smallEmbedder());
+    expect(await small.reindex({ batchSize: 2 })).toEqual({ embedded: CORPUS.length, remaining: 0, error: null });
+    expect((await small.recallMemories("vpn port forwarding", { limit: 1 }))[0].title).toBe("Gluetun port forwarding");
+    await small.disconnect();
+    const refilled = await embeddingState(url);
+    expect(refilled.embedded).toBe(CORPUS.length);
+    expect(refilled.models).toEqual([SMALL_MODEL]);
+  }, 30_000);
+
+  test("CLI: migrate embedding --dry-run prints the plan and changes nothing; without it, migrates", async () => {
+    const url = await freshDatabase();
+    const seeded = await openBackend(url);
+    for (const [title, content] of CORPUS) await seeded.storeMemory(mem(title, content));
+    await seeded.disconnect();
+    await makeLegacyVectorStore(url);
+    const env = {
+      MEMORY_BACKEND: "postgres",
+      MEMORY_POSTGRES_URL: url,
+      MEMORY_POSTGRES_PASSWORD: PASSWORD ?? "",
+      MEMORY_EMBED_URL: "http://127.0.0.1:1",
+    };
+    const snapshot = () =>
+      withClient(url, async (c) => ({
+        state: await embeddingState(url),
+        rows: await c`SELECT id, updated_at, embedding::text AS v, embedding_model FROM memories ORDER BY id`,
+      }));
+
+    const before = await snapshot();
+    const dry = await runCli(["migrate", "embedding", "--dry-run"], env);
+    expect(dry.code).toBe(0);
+    expect(dry.stdout).toContain("Embedding column: vector(1024) -> halfvec(1024)");
+    expect(dry.stdout).toContain(`Memories: ${CORPUS.length} (${CORPUS.length} embedded)`);
+    expect(dry.stdout).toContain("Action: cast");
+    expect(dry.stdout).toContain("ALTER TABLE memories ALTER COLUMN embedding TYPE halfvec(1024) USING embedding::halfvec(1024);");
+    expect(dry.stdout).toContain("Dry run: nothing was changed.");
+    expect(dry.stdout + dry.stderr).not.toContain(PASSWORD ?? "\u0000");
+    expect(await snapshot()).toEqual(before);
+
+    const run = await runCli(["migrate", "embedding"], env);
+    expect(run.code).toBe(0);
+    expect(run.stdout).toContain("Migrated.");
+    expect((await embeddingState(url)).column).toBe("halfvec(1024)");
+    const again = await runCli(["migrate", "embedding", "--dry-run"], env);
+    expect(again.stdout).toContain("Action: none");
+  }, 60_000);
+
   test("duplicate check warns with the nearest match, logs it, and still stores", async () => {
     const original = await backend.storeMemory(
       mem("pct exec drops multiline arguments", "pct exec drops multiline arguments passed to the container")
@@ -574,6 +823,21 @@ describe("postgres helpers", () => {
       [{ id: "a", score: 0.9 }, { id: "b", score: 0.1 }],
     ]);
     expect(fused.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  test("the embedder rejects a dimension pgvector cannot index as halfvec", () => {
+    expect(new OllamaEmbedder({ dimension: 2560 }).dimension).toBe(2560);
+    expect(() => new OllamaEmbedder({ dimension: 4001 })).toThrow(/MEMORY_EMBED_DIMENSION must be an integer from 1 to 4000/);
+    expect(() => new OllamaEmbedder({ dimension: Number("abc") })).toThrow(/MEMORY_EMBED_DIMENSION/);
+    expect(() => new OllamaEmbedder({ dimension: 0 })).toThrow(/MEMORY_EMBED_DIMENSION/);
+  });
+
+  test("formatEmbeddingPlan names a store with no memories table", () => {
+    const text = formatEmbeddingPlan(
+      { current: null, target: "halfvec(1024)", action: "none", memories: 0, embedded: 0, otherModel: 0, model: "m", statements: [] },
+      true
+    );
+    expect(text).toContain("No memories table yet");
   });
 
   test("embedder is unavailable without MEMORY_EMBED_URL", async () => {

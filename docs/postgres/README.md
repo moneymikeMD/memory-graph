@@ -25,6 +25,7 @@ and a pgvector cosine ranking fused by reciprocal-rank fusion (k = 60).
 | `MEMORY_EMBED_URL` | | Ollama base URL, for example `http://embedder:11434`. Unset means no vectors and full-text-only recall. |
 | `MEMORY_EMBED_MODEL` | `qwen3-embedding:0.6b` | |
 | `MEMORY_EMBED_DIGEST` | `ac6da0df…15621d` | The model digest the benchmark used. It is checked against `/api/tags` before the first embed in each process. |
+| `MEMORY_EMBED_DIMENSION` | `1024` | The model's output dimension, 1 to 4000 (pgvector's HNSW limit for `halfvec`). It must match the `embedding` column; see Changing the embedding model. |
 | `MEMORY_EMBED_TIMEOUT_MS` | `30000` | |
 | `MEMORY_DUPLICATE_THRESHOLD` | `0.86` | Cosine at which `store` warns about a possible duplicate. |
 
@@ -37,11 +38,20 @@ never print the password.
 transaction-scoped advisory lock, so concurrent CLI calls (for example from
 hooks) do not race each other's `CREATE ... IF NOT EXISTS`.
 
-- `memories` holds every `Memory` field plus `embedding vector(1024)`,
-  `embedding_model` and `embedding_error`, and a stored generated
-  `search_vector` (`to_tsvector('english', title || content || summary)`). It
-  is indexed with GIN (full-text) and HNSW (`vector_cosine_ops`). This matches
-  the bench's `sql/bench-memory/schema.sql`.
+- `memories` holds every `Memory` field plus `embedding halfvec(N)`, where N
+  is `MEMORY_EMBED_DIMENSION`, `embedding_model` and `embedding_error`, and a
+  stored generated `search_vector`
+  (`to_tsvector('english', title || content || summary)`). It is indexed with
+  GIN (full-text) and HNSW (`halfvec_cosine_ops`). The bench's
+  `sql/bench-memory/schema.sql` used `vector(1024)`. `halfvec` stores 16-bit
+  floats, so models over `vector`'s 2,000-dimension index limit can be
+  indexed, for example `qwen3-embedding:4b` at 2,560.
+- At every start, `initializeSchema` checks the `embedding` column's
+  dimension against `MEMORY_EMBED_DIMENSION` and fails on a mismatch:
+  `memories.embedding is halfvec(1024) but MEMORY_EMBED_DIMENSION is 2560;
+  run 'memorygraph migrate embedding --dry-run' to see the migration plan`.
+  A store created before `halfvec` (a `vector(1024)` column) keeps working at
+  the same dimension until it is migrated.
 - `links` holds relationships: type, strength, confidence and the bi-temporal
   fields. Deleting a memory cascades to its links.
 - `duplicate_events` has one row per duplicate warning:
@@ -200,6 +210,38 @@ Each imported memory is embedded as it is written. The verify step requires
 equal counts, so the target must start empty. `--dry-run` validates both ends
 and exports without writing. With `--to <backend>` and no `--to-path` or
 `--to-uri`, the target's settings come from the environment (see Deviations).
+
+## Changing the embedding model
+
+`memorygraph migrate embedding` moves an existing store's `embedding` column
+to `halfvec(N)`, where N is `MEMORY_EMBED_DIMENSION`. `--dry-run` prints the
+plan and changes nothing: it runs only reads, inside a `READ ONLY`
+transaction, and skips `initializeSchema`. Without `--dry-run`, it runs the
+plan in one transaction under the schema advisory lock.
+
+| Current column | Action | What happens |
+|---|---|---|
+| `vector(N)`, same N | `cast` | Drops the HNSW index, runs `ALTER COLUMN embedding TYPE halfvec(N) USING embedding::halfvec(N)`, and rebuilds the index. Every vector is kept, rounded to 16-bit floats. |
+| any other dimension | `retype` | Drops the index, retypes the column with every embedding NULL, clears `embedding_model`, and rebuilds the index. Run `memorygraph reindex` afterwards to embed every memory with the new model. |
+| `halfvec(N)` without a `halfvec_cosine_ops` index | `create-index` | Rebuilds the index. |
+| `halfvec(N)` with the index | `none` | Nothing. The command is idempotent. |
+
+If the model changes but the dimension does not, `cast` keeps the old
+model's vectors. The plan counts the memories embedded with a model other
+than `MEMORY_EMBED_MODEL` and says to run `memorygraph reindex --all`.
+
+To move a store to a new model:
+
+```bash
+MEMORY_EMBED_MODEL=<model> MEMORY_EMBED_DIGEST=<digest> MEMORY_EMBED_DIMENSION=<N> \
+  memorygraph migrate embedding --dry-run     # read the plan
+# take a backup, then run the same command without --dry-run
+MEMORY_EMBED_MODEL=<model> MEMORY_EMBED_DIGEST=<digest> MEMORY_EMBED_DIMENSION=<N> \
+  memorygraph reindex                          # after a retype; --all after a same-dimension model change
+```
+
+Every client of the store needs the same three variables. A client left on
+the old dimension fails at startup with the mismatch error.
 
 ## Testing
 
