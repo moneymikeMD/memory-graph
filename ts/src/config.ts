@@ -99,6 +99,14 @@ function env(names: string[]): string | undefined {
   return undefined;
 }
 
+/**
+ * Directory for the embed breaker file: a non-empty $XDG_RUNTIME_DIR on Linux,
+ * where os.tmpdir() is the shared /tmp; otherwise os.tmpdir().
+ */
+export function embedBreakerDir(platform: string, runtimeDir: string | undefined): string {
+  return (platform === "linux" && runtimeDir) || tmpdir();
+}
+
 function envStr(names: string[], fallback: string): string {
   return env(names) ?? fallback;
 }
@@ -272,12 +280,13 @@ export class Config {
   static get EMBED_BREAKER_MS(): number {
     return envInt(["MEMORY_EMBED_BREAKER_MS"], 60000);
   }
-  /** Per-user by default: $XDG_RUNTIME_DIR on Linux, where os.tmpdir() is the shared /tmp. */
   static get EMBED_BREAKER_PATH(): string {
-    const runtimeDir = process.platform === "linux" ? env(["XDG_RUNTIME_DIR"]) : undefined;
     return envStr(
       ["MEMORY_EMBED_BREAKER_PATH"],
-      join(runtimeDir ?? tmpdir(), `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`)
+      join(
+        embedBreakerDir(process.platform, env(["XDG_RUNTIME_DIR"])),
+        `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`
+      )
     );
   }
   static get DUPLICATE_THRESHOLD(): number | undefined {

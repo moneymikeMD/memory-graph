@@ -5,7 +5,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { createServer, type Server } from "node:http";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
@@ -18,7 +18,7 @@ import {
   type EmbedderOptions,
   type SocketFactory,
 } from "../src/backends/postgres-embedder.ts";
-import { Config } from "../src/config.ts";
+import { Config, embedBreakerDir } from "../src/config.ts";
 
 const MODEL = "stub-embed:4";
 const DIGEST = "stub-digest-good";
@@ -31,7 +31,7 @@ interface Stub {
   close: () => Promise<void>;
 }
 
-type StubMode = "ok" | "wrong-digest" | "wrong-model" | "http-500" | "hang-tags" | "embed-500";
+type StubMode = "ok" | "wrong-digest" | "wrong-model" | "http-500" | "slow-500" | "hang-tags" | "embed-500";
 
 async function startStub(mode: StubMode = "ok"): Promise<Stub> {
   const stub = { url: "", tags: 0, embeds: 0, close: async () => {} };
@@ -43,6 +43,13 @@ async function startStub(mode: StubMode = "ok"): Promise<Stub> {
       if (req.url === "/api/tags") {
         stub.tags++;
         if (mode === "hang-tags") return;
+        if (mode === "slow-500") {
+          setTimeout(() => {
+            res.statusCode = 500;
+            res.end("{}");
+          }, 250);
+          return;
+        }
         if (mode === "http-500") {
           res.statusCode = 500;
           res.end("{}");
@@ -251,6 +258,27 @@ describe("OllamaEmbedder URL list", () => {
     expect(breakerState()[a.url].reason).toMatch(/timed out after \d+ ms/);
   });
 
+  test("a timeout cut short by the deadline opens no breaker for that URL", async () => {
+    const slow = await stub("slow-500");
+    const hang = await stub("hang-tags");
+    const emb = make([slow.url, hang.url], { timeoutMs: 400, connectTimeoutMs: 100 });
+    const { result } = await captureStderr(() => emb.embed(["x"]));
+    expect(result).toBeInstanceOf(EmbedderUnavailableError);
+    expect((result as Error).message).toContain(`${hang.url}: embedder /api/tags timed out`);
+    expect(hang.tags).toBe(1);
+    expect(Object.keys(breakerState())).toEqual([slow.url]);
+  });
+
+  test("the temporary breaker file is removed when the rename fails", async () => {
+    const down = await closedPortUrl();
+    const b = await stub();
+    const target = join(dir, "state");
+    mkdirSync(join(target, "occupied"), { recursive: true });
+    const emb = make([down, b.url], { breakerPath: target });
+    expect(await emb.embed(["x"])).toHaveLength(1);
+    expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+
   test("the remaining URLs get what is left of the deadline", async () => {
     const asleep = await stub();
     const b = await stub();
@@ -395,6 +423,13 @@ describe("embedder config", () => {
     expect(Config.EMBED_BREAKER_MS).toBe(60000);
     const dir = process.platform === "linux" && process.env.XDG_RUNTIME_DIR ? process.env.XDG_RUNTIME_DIR : tmpdir();
     expect(Config.EMBED_BREAKER_PATH).toBe(join(dir, `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`));
+  });
+
+  test("the breaker directory is a non-empty $XDG_RUNTIME_DIR on Linux, else the OS temp dir", () => {
+    expect(embedBreakerDir("linux", "/run/user/1000")).toBe("/run/user/1000");
+    expect(embedBreakerDir("linux", "")).toBe(tmpdir());
+    expect(embedBreakerDir("linux", undefined)).toBe(tmpdir());
+    expect(embedBreakerDir("darwin", "/run/user/1000")).toBe(tmpdir());
   });
 
   test("each variable overrides its default", () => {

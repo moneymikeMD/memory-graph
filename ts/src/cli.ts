@@ -316,7 +316,7 @@ ENVIRONMENT VARIABLES:
   MEMORY_EMBED_DIMENSION      Embedding dimension; must match the halfvec column [default: 1024]
   MEMORY_EMBED_CONNECT_TIMEOUT_MS  URL list only: TCP connect timeout per URL [default: 250]
   MEMORY_EMBED_BREAKER_MS     URL list only: how long a failed URL is skipped; 0 disables [default: 60000]
-  MEMORY_EMBED_BREAKER_PATH   URL list only: breaker state file [default: $XDG_RUNTIME_DIR on Linux, else tmpdir, /memorygraph-embed-breaker-<uid>.json]
+  MEMORY_EMBED_BREAKER_PATH   URL list only: breaker state file [default: <dir>/memorygraph-embed-breaker-<uid>.json, <dir> = $XDG_RUNTIME_DIR on Linux, else the OS temp dir]
   MEMORY_DUPLICATE_THRESHOLD  Cosine at which store warns of a possible duplicate [default: 0.86]
   MEMORYGRAPH_API_KEY         API key for cloud backend
   MEMORYGRAPH_API_URL         Cloud API URL [default: https://graph-api.memorygraph.dev]
