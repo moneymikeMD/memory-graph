@@ -18,6 +18,7 @@
  *      collide.
  */
 
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -264,6 +265,19 @@ export class Config {
   }
   static get EMBED_TIMEOUT_MS(): number {
     return envInt(["MEMORY_EMBED_TIMEOUT_MS"], 30000);
+  }
+  static get EMBED_CONNECT_TIMEOUT_MS(): number {
+    return envInt(["MEMORY_EMBED_CONNECT_TIMEOUT_MS"], 250);
+  }
+  static get EMBED_BREAKER_MS(): number {
+    return envInt(["MEMORY_EMBED_BREAKER_MS"], 60000);
+  }
+  /** Per-user by default: os.tmpdir() is per-user on macOS but shared /tmp on Linux. */
+  static get EMBED_BREAKER_PATH(): string {
+    return envStr(
+      ["MEMORY_EMBED_BREAKER_PATH"],
+      join(tmpdir(), `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`)
+    );
   }
   static get DUPLICATE_THRESHOLD(): number | undefined {
     const raw = env(["MEMORY_DUPLICATE_THRESHOLD"]);

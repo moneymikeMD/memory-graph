@@ -32,6 +32,7 @@ const STUB_DIGEST = "stub0000digest";
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 const SMALL_MODEL = "stub-embed:64";
 const SMALL_DIMENSION = 64;
+const BREAKER_PATH = join(tmpdir(), `mg-pg-breaker-${randomUUID()}.json`);
 
 function stubVector(text: string, dimension = DEFAULT_EMBED_DIMENSION): number[] {
   const vec = new Array<number>(dimension).fill(0);
@@ -134,6 +135,7 @@ function runCli(args: string[], env: Record<string, string>): Promise<{ code: nu
         MEMORY_LOG_LEVEL: "ERROR",
         MEMORY_FALKORDB_HOST: "127.0.0.1",
         MEMORY_FALKORDB_PORT: "1",
+        MEMORY_EMBED_BREAKER_PATH: BREAKER_PATH,
         ...env,
       },
     });
@@ -163,6 +165,7 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
   let stub: Awaited<ReturnType<typeof startStubEmbedder>>;
   const created: string[] = [];
   let backend: PostgresBackend;
+  let savedBreakerPath: string | undefined;
 
   async function freshDatabase(): Promise<string> {
     const name = `mg_test_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
@@ -249,6 +252,8 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     if (!LOOPBACK.has(host)) {
       throw new Error(`MEMORYGRAPH_TEST_POSTGRES_URL must point at a loopback host, not ${host}`);
     }
+    savedBreakerPath = process.env.MEMORY_EMBED_BREAKER_PATH;
+    process.env.MEMORY_EMBED_BREAKER_PATH = BREAKER_PATH;
     admin = postgres(TEST_URL!, { password: PASSWORD, onnotice: () => {}, max: 1 });
     stub = await startStubEmbedder();
   }, 30_000);
@@ -260,6 +265,9 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     }
     await admin?.end({ timeout: 5 });
     stub?.server.close();
+    if (savedBreakerPath === undefined) delete process.env.MEMORY_EMBED_BREAKER_PATH;
+    else process.env.MEMORY_EMBED_BREAKER_PATH = savedBreakerPath;
+    rmSync(BREAKER_PATH, { force: true });
   }, 60_000);
 
   beforeEach(async () => {
@@ -416,6 +424,7 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     await down.disconnect();
     expect(result.map((m) => m.title)).toEqual(["Gluetun port forwarding"]);
     expect(stderr).toContain("full-text only");
+    expect(result[0].match_info?.["match_quality"]).toBe("fulltext");
   });
 
   test("store without an embedder records the gap; reindex fills it", async () => {

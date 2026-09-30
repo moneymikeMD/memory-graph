@@ -22,11 +22,14 @@ and a pgvector cosine ranking fused by reciprocal-rank fusion (k = 60).
 | `MEMORY_POSTGRES_DB` | `memorygraph` | |
 | `MEMORY_POSTGRES_USER` | `memorygraph` | |
 | `MEMORY_POSTGRES_PASSWORD` | | Read from the environment only. There is no flag for it. |
-| `MEMORY_EMBED_URL` | | Ollama base URL, for example `http://embedder:11434`. Unset means no vectors and full-text-only recall. |
+| `MEMORY_EMBED_URL` | | Ollama base URL, for example `http://embedder:11434`, or a comma-separated list tried in order, for example `http://gpu:11434,http://cpu:11434`. Unset means no vectors and full-text-only recall. See Embedder failover. |
 | `MEMORY_EMBED_MODEL` | `qwen3-embedding:0.6b` | |
-| `MEMORY_EMBED_DIGEST` | `ac6da0df…15621d` | The model digest the benchmark used. It is checked against `/api/tags` before the first embed in each process. |
+| `MEMORY_EMBED_DIGEST` | `ac6da0df…15621d` | The model digest the benchmark used. It is checked against each URL's `/api/tags` before that URL embeds anything in a process. |
 | `MEMORY_EMBED_DIMENSION` | `1024` | The model's output dimension, 1 to 4000 (pgvector's HNSW limit for `halfvec`). It must match the `embedding` column; see Changing the embedding model. |
-| `MEMORY_EMBED_TIMEOUT_MS` | `30000` | |
+| `MEMORY_EMBED_TIMEOUT_MS` | `30000` | Timeout for each HTTP request to an embedder. |
+| `MEMORY_EMBED_CONNECT_TIMEOUT_MS` | `250` | TCP connect timeout for each URL, checked before any HTTP request. The default is a guess: ample for a 2 ms LAN, not measured against a sleeping host. |
+| `MEMORY_EMBED_BREAKER_MS` | `60000` | How long a failed URL is skipped by every process. `0` disables the breaker. The default is a guess. |
+| `MEMORY_EMBED_BREAKER_PATH` | `<tmpdir>/memorygraph-embed-breaker-<uid>.json` | The breaker state file. `<tmpdir>` is `os.tmpdir()`, which is per-user on macOS and `/tmp` on Linux. |
 | `MEMORY_DUPLICATE_THRESHOLD` | `0.86` | Cosine at which `store` warns about a possible duplicate. |
 
 Connection messages and `stats` name the server as `host:port/database`. They
@@ -65,12 +68,43 @@ serving a different digest, or returning the wrong dimension:
 
 - `store` and `update` still write the memory, with `embedding` NULL and the
   reason in `embedding_error`. A line on stderr says to run `reindex`.
-- The first failure latches for the rest of the process, so an import against
-  a down embedder costs one timeout, not one per memory.
+- When every URL has failed, the failure latches for the rest of the process,
+  so an import against a down embedder costs one round of probes, not one per
+  memory.
 - `memorygraph reindex` embeds every memory whose vector is NULL, in batches
   (`--batch-size`, default 16). `--all` re-embeds everything, for example
   after a model change. `stats` reports how many memories are still missing a
   vector.
+
+### Embedder failover
+
+`MEMORY_EMBED_URL` is split on commas; whitespace, trailing slashes, empty
+entries and repeated URLs are dropped. A single URL is a one-entry list. On the
+first embed in a process, each URL is tried in order:
+
+1. A URL whose breaker is open is skipped without any network call.
+2. A TCP connection must open within `MEMORY_EMBED_CONNECT_TIMEOUT_MS`.
+3. `GET /api/tags` must list `MEMORY_EMBED_MODEL` with digest
+   `MEMORY_EMBED_DIGEST`. A host serving another model or digest is skipped,
+   not used, and stderr says `memorygraph: skipping embedder <url>: <reason>`
+   once: the same reason is not logged again while it stays in the breaker file.
+4. The first URL that passes is used for the rest of the process. If an
+   `/api/embed` call on it fails later, that URL's breaker opens and the next
+   untried URL is probed.
+
+A URL that fails any step gets a breaker entry `{until, reason}` in
+`MEMORY_EMBED_BREAKER_PATH`, and every process skips it until `until`
+(`MEMORY_EMBED_BREAKER_MS` after the failure). Each hook call is a new
+process, so without the file a sleeping host would cost its connect timeout
+on every call. The file is written to a temporary name and renamed. Two
+processes that trip different URLs at the same moment can lose one entry; the
+cost is one extra probe. An unreadable or unwritable file is treated as empty
+and never stops embedding. A URL that passes after its entry has expired has
+the entry removed.
+
+Only when every URL fails does the embed fail. Then `store` records the
+combined reason (one `<url>: <reason>` per URL) and recall runs full-text only
+and reports `match_quality: "fulltext"` instead of `"hybrid"`.
 
 ## Recall
 
@@ -81,9 +115,9 @@ serving a different digest, or returning the wrong dimension:
 2. The vector arm embeds the lower-cased query and ranks by cosine.
 3. Both arms over-fetch `max(4 × limit, 50)` rows and are fused by RRF.
 
-When the query cannot be embedded, recall uses the full-text arm alone and
-says so once on stderr: `recall is full-text only: the query could not be
-embedded (<reason>)`.
+When the query cannot be embedded, recall uses the full-text arm alone, sets
+each result's `match_quality` to `fulltext`, and says so once on stderr:
+`recall is full-text only: the query could not be embedded (<reason>)`.
 
 ### Deviations
 
@@ -244,6 +278,10 @@ Every client of the store needs the same three variables. A client left on
 the old dimension fails at startup with the mismatch error.
 
 ## Testing
+
+`ts/tests/postgres-embedder.test.ts` covers embedder failover and the breaker
+against stub Ollama servers and closed ports on 127.0.0.1. It needs no
+database and runs in every `bun test`.
 
 `ts/tests/postgres-backend.test.ts` runs only when
 `MEMORYGRAPH_TEST_POSTGRES_URL` is set, and it refuses any host that is not

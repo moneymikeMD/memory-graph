@@ -310,10 +310,13 @@ ENVIRONMENT VARIABLES:
   MEMORY_POSTGRES_DB          Postgres database [default: memorygraph]
   MEMORY_POSTGRES_USER        Postgres user [default: memorygraph]
   MEMORY_POSTGRES_PASSWORD    Postgres password (env only, never a flag)
-  MEMORY_EMBED_URL            Ollama URL for postgres embeddings; unset means full-text only
+  MEMORY_EMBED_URL            Ollama URL, or comma-separated URLs tried in order; unset means full-text only
   MEMORY_EMBED_MODEL          Embedding model [default: qwen3-embedding:0.6b]
   MEMORY_EMBED_DIGEST         Expected model digest, verified against /api/tags before embedding
   MEMORY_EMBED_DIMENSION      Embedding dimension; must match the halfvec column [default: 1024]
+  MEMORY_EMBED_CONNECT_TIMEOUT_MS  TCP connect timeout per embedder URL [default: 250]
+  MEMORY_EMBED_BREAKER_MS     How long a failed embedder URL is skipped; 0 disables [default: 60000]
+  MEMORY_EMBED_BREAKER_PATH   Breaker state file shared across processes [default: <tmpdir>/memorygraph-embed-breaker-<uid>.json]
   MEMORY_DUPLICATE_THRESHOLD  Cosine at which store warns of a possible duplicate [default: 0.86]
   MEMORYGRAPH_API_KEY         API key for cloud backend
   MEMORYGRAPH_API_URL         Cloud API URL [default: https://graph-api.memorygraph.dev]
