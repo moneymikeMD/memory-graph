@@ -119,6 +119,9 @@ export class PostgresBackend implements GraphBackend {
         digest: Config.EMBED_DIGEST,
         dimension: Config.EMBED_DIMENSION,
         timeoutMs: Config.EMBED_TIMEOUT_MS,
+        connectTimeoutMs: Config.EMBED_CONNECT_TIMEOUT_MS,
+        breakerMs: Config.EMBED_BREAKER_MS,
+        breakerPath: Config.EMBED_BREAKER_PATH,
       });
     this.duplicateThreshold =
       opts.duplicateThreshold ?? Config.DUPLICATE_THRESHOLD ?? DEFAULT_DUPLICATE_THRESHOLD;
@@ -466,7 +469,7 @@ export class PostgresBackend implements GraphBackend {
       const row = byId.get(r.id);
       const mem = row ? rowToMemory(row) : null;
       if (mem) {
-        mem.match_info = { match_quality: "hybrid", rrf_score: r.score };
+        mem.match_info = { match_quality: vectors ? "hybrid" : "fulltext", rrf_score: r.score };
         out.push(mem);
       }
     }

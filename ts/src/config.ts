@@ -18,6 +18,7 @@
  *      collide.
  */
 
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -96,6 +97,14 @@ function env(names: string[]): string | undefined {
     if (val !== undefined) return val;
   }
   return undefined;
+}
+
+/**
+ * Directory for the embed breaker file: a non-empty $XDG_RUNTIME_DIR on Linux,
+ * where os.tmpdir() is the shared /tmp; otherwise os.tmpdir().
+ */
+export function embedBreakerDir(platform: string, runtimeDir: string | undefined): string {
+  return (platform === "linux" && runtimeDir) || tmpdir();
 }
 
 function envStr(names: string[], fallback: string): string {
@@ -264,6 +273,21 @@ export class Config {
   }
   static get EMBED_TIMEOUT_MS(): number {
     return envInt(["MEMORY_EMBED_TIMEOUT_MS"], 30000);
+  }
+  static get EMBED_CONNECT_TIMEOUT_MS(): number {
+    return envInt(["MEMORY_EMBED_CONNECT_TIMEOUT_MS"], 250);
+  }
+  static get EMBED_BREAKER_MS(): number {
+    return envInt(["MEMORY_EMBED_BREAKER_MS"], 60000);
+  }
+  static get EMBED_BREAKER_PATH(): string {
+    return envStr(
+      ["MEMORY_EMBED_BREAKER_PATH"],
+      join(
+        embedBreakerDir(process.platform, env(["XDG_RUNTIME_DIR"])),
+        `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`
+      )
+    );
   }
   static get DUPLICATE_THRESHOLD(): number | undefined {
     const raw = env(["MEMORY_DUPLICATE_THRESHOLD"]);
