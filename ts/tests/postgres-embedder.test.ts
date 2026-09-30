@@ -5,7 +5,9 @@
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +16,7 @@ import {
   EmbedderUnavailableError,
   parseEmbedUrls,
   type EmbedderOptions,
+  type SocketFactory,
 } from "../src/backends/postgres-embedder.ts";
 import { Config } from "../src/config.ts";
 
@@ -28,7 +31,7 @@ interface Stub {
   close: () => Promise<void>;
 }
 
-type StubMode = "ok" | "wrong-digest" | "http-500" | "hang-tags" | "embed-500";
+type StubMode = "ok" | "wrong-digest" | "wrong-model" | "http-500" | "hang-tags" | "embed-500";
 
 async function startStub(mode: StubMode = "ok"): Promise<Stub> {
   const stub = { url: "", tags: 0, embeds: 0, close: async () => {} };
@@ -46,7 +49,8 @@ async function startStub(mode: StubMode = "ok"): Promise<Stub> {
           return;
         }
         const digest = mode === "wrong-digest" ? "stub-digest-other" : DIGEST;
-        res.end(JSON.stringify({ models: [{ name: MODEL, digest }] }));
+        const name = mode === "wrong-model" ? "other-model:1" : MODEL;
+        res.end(JSON.stringify({ models: [{ name, digest }] }));
       } else if (req.url === "/api/embed") {
         stub.embeds++;
         if (mode === "embed-500") {
@@ -71,6 +75,17 @@ async function startStub(mode: StubMode = "ok"): Promise<Stub> {
       server.close(() => resolve());
     });
   return stub;
+}
+
+/** A socket that never connects and never errors, like a SYN to a sleeping host. */
+function silentSocket(): EventEmitter & { destroy: () => void } {
+  return Object.assign(new EventEmitter(), { destroy: () => {} });
+}
+
+/** Connect normally, except to the given URLs, whose sockets never connect. */
+function blackhole(...urls: string[]): SocketFactory {
+  const ports = new Set(urls.map((u) => Number(new URL(u).port)));
+  return (target) => (ports.has(target.port) ? silentSocket() : createConnection(target));
 }
 
 /** A loopback URL whose port was just released, so connecting to it is refused. */
@@ -150,6 +165,102 @@ describe("OllamaEmbedder URL list", () => {
     expect(a.embeds).toBe(2);
   });
 
+  test("a single URL keeps 8744d66's error text, logs nothing, probes no socket and persists no breaker", async () => {
+    const noSocket: SocketFactory = () => {
+      throw new Error("a single URL must not open a probe socket");
+    };
+    const cases: Array<[StubMode | "refused", (url: string) => string | RegExp]> = [
+      ["wrong-digest", () => `embedder digest mismatch for ${MODEL}: expected ${DIGEST}, served stub-digest-other`],
+      ["wrong-model", (url) => `embedder at ${url} does not serve ${MODEL}`],
+      ["http-500", () => "embedder /api/tags returned HTTP 500"],
+      ["hang-tags", () => "embedder /api/tags timed out after 200 ms"],
+      ["embed-500", () => "embedder /api/embed returned HTTP 500"],
+      ["refused", (url) => new RegExp(`^embedder at ${url.replace(/[.]/g, "[.]")} unreachable: TypeError: Unable to connect`)],
+    ];
+    for (const [mode, expected] of cases) {
+      const url = mode === "refused" ? await closedPortUrl() : (await stub(mode)).url;
+      const emb = make([url], { timeoutMs: 200, connect: noSocket });
+      const { result, stderr } = await captureStderr(() => emb.embed(["x"]));
+      expect(result).toBeInstanceOf(EmbedderUnavailableError);
+      const want = expected(url);
+      if (typeof want === "string") expect((result as Error).message).toBe(want);
+      else expect((result as Error).message).toMatch(want);
+      expect(emb.unavailableReason()).toBe((result as Error).message);
+      expect(stderr).toEqual([]);
+      expect(existsSync(breakerPath)).toBe(false);
+    }
+    const flaky = await stub("http-500");
+    await make([flaky.url]).embed(["x"]).catch(() => {});
+    await make([flaky.url]).embed(["x"]).catch(() => {});
+    expect(flaky.tags).toBe(2);
+  });
+
+  test("a never-connecting first URL fails at connectTimeoutMs and the chain fails over", async () => {
+    const asleep = await stub();
+    const b = await stub();
+    const emb = make([asleep.url, b.url], { connectTimeoutMs: 80, connect: blackhole(asleep.url) });
+    const started = Date.now();
+    expect(await emb.embed(["x"])).toHaveLength(1);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(75);
+    expect(elapsed).toBeLessThan(1000);
+    expect(emb.activeUrl()).toBe(b.url);
+    expect(asleep.tags).toBe(0);
+    expect(breakerState()[asleep.url].reason).toContain("did not accept a connection within 80 ms");
+  });
+
+  test("concurrent embed() calls share one selection and both return", async () => {
+    for (const urls of [1, 2]) {
+      const a = await stub();
+      const list = urls === 1 ? [a.url] : [a.url, (await stub()).url];
+      const emb = make(list);
+      const results = await Promise.all([emb.embed(["x"]), emb.embed(["y"]), emb.embed(["z"])]);
+      expect(results.map((r) => r.length)).toEqual([1, 1, 1]);
+      expect(a.tags).toBe(1);
+      expect(emb.unavailableReason()).toBeNull();
+    }
+  });
+
+  test("a breaker entry far in the future is clamped to one breaker window", async () => {
+    const a = await stub();
+    const b = await stub();
+    writeFileSync(breakerPath, JSON.stringify({ version: 1, urls: { [a.url]: { until: 9e15, reason: "planted" } } }));
+    const first = make([a.url, b.url], { breakerMs: 100 });
+    await first.embed(["x"]);
+    expect(first.activeUrl()).toBe(b.url);
+    expect(breakerState()[a.url].until).toBeLessThanOrEqual(Date.now() + 100);
+    await Bun.sleep(150);
+    const later = make([a.url, b.url], { breakerMs: 100 });
+    await later.embed(["y"]);
+    expect(later.activeUrl()).toBe(a.url);
+  });
+
+  test("MEMORY_EMBED_TIMEOUT_MS bounds the whole chain in one embed() call", async () => {
+    const a = await stub("hang-tags");
+    const b = await stub("hang-tags");
+    const emb = make([a.url, b.url], { timeoutMs: 300 });
+    const started = Date.now();
+    const { result } = await captureStderr(() => emb.embed(["x"]));
+    const elapsed = Date.now() - started;
+    expect(result).toBeInstanceOf(EmbedderUnavailableError);
+    expect(elapsed).toBeLessThan(550);
+    expect((result as Error).message).toContain("embed deadline of 300 ms spent");
+    expect(b.tags).toBe(0);
+    expect(emb.unavailableReason()).toBeNull();
+    expect(Object.keys(breakerState())).toEqual([a.url]);
+    expect(breakerState()[a.url].reason).toMatch(/timed out after \d+ ms/);
+  });
+
+  test("the remaining URLs get what is left of the deadline", async () => {
+    const asleep = await stub();
+    const b = await stub();
+    const emb = make([asleep.url, b.url], { timeoutMs: 400, connectTimeoutMs: 250, connect: blackhole(asleep.url) });
+    const started = Date.now();
+    expect(await emb.embed(["x"])).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(400);
+    expect(emb.activeUrl()).toBe(b.url);
+  });
+
   test("first URL up: the second URL is never contacted", async () => {
     const a = await stub();
     const b = await stub();
@@ -181,15 +292,6 @@ describe("OllamaEmbedder URL list", () => {
     await nextProcess.embed(["y"]);
     expect(nextProcess.activeUrl()).toBe(b.url);
     expect(a.tags).toBe(1);
-  });
-
-  test("first URL hanging on /api/tags times out and falls back", async () => {
-    const a = await stub("hang-tags");
-    const b = await stub();
-    const emb = make([a.url, b.url], { timeoutMs: 200 });
-    await emb.embed(["x"]);
-    expect(emb.activeUrl()).toBe(b.url);
-    expect(breakerState()[a.url].reason).toContain("timed out after 200 ms");
   });
 
   test("first URL serving the wrong digest is skipped, not used, and the skip is logged once", async () => {
@@ -288,12 +390,11 @@ describe("embedder config", () => {
     }
   });
 
-  test("defaults: 250 ms connect timeout, 60 s breaker, a per-user file in the temp directory", () => {
+  test("defaults: 250 ms connect timeout, 60 s breaker, a per-user breaker file", () => {
     expect(Config.EMBED_CONNECT_TIMEOUT_MS).toBe(250);
     expect(Config.EMBED_BREAKER_MS).toBe(60000);
-    expect(Config.EMBED_BREAKER_PATH).toBe(
-      join(tmpdir(), `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`)
-    );
+    const dir = process.platform === "linux" && process.env.XDG_RUNTIME_DIR ? process.env.XDG_RUNTIME_DIR : tmpdir();
+    expect(Config.EMBED_BREAKER_PATH).toBe(join(dir, `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`));
   });
 
   test("each variable overrides its default", () => {

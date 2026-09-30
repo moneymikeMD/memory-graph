@@ -272,11 +272,12 @@ export class Config {
   static get EMBED_BREAKER_MS(): number {
     return envInt(["MEMORY_EMBED_BREAKER_MS"], 60000);
   }
-  /** Per-user by default: os.tmpdir() is per-user on macOS but shared /tmp on Linux. */
+  /** Per-user by default: $XDG_RUNTIME_DIR on Linux, where os.tmpdir() is the shared /tmp. */
   static get EMBED_BREAKER_PATH(): string {
+    const runtimeDir = process.platform === "linux" ? env(["XDG_RUNTIME_DIR"]) : undefined;
     return envStr(
       ["MEMORY_EMBED_BREAKER_PATH"],
-      join(tmpdir(), `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`)
+      join(runtimeDir ?? tmpdir(), `memorygraph-embed-breaker-${process.getuid?.() ?? "user"}.json`)
     );
   }
   static get DUPLICATE_THRESHOLD(): number | undefined {

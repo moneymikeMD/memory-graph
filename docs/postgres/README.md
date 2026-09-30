@@ -26,10 +26,10 @@ and a pgvector cosine ranking fused by reciprocal-rank fusion (k = 60).
 | `MEMORY_EMBED_MODEL` | `qwen3-embedding:0.6b` | |
 | `MEMORY_EMBED_DIGEST` | `ac6da0df…15621d` | The model digest the benchmark used. It is checked against each URL's `/api/tags` before that URL embeds anything in a process. |
 | `MEMORY_EMBED_DIMENSION` | `1024` | The model's output dimension, 1 to 4000 (pgvector's HNSW limit for `halfvec`). It must match the `embedding` column; see Changing the embedding model. |
-| `MEMORY_EMBED_TIMEOUT_MS` | `30000` | Timeout for each HTTP request to an embedder. |
-| `MEMORY_EMBED_CONNECT_TIMEOUT_MS` | `250` | TCP connect timeout for each URL, checked before any HTTP request. The default is a guess: ample for a 2 ms LAN, not measured against a sleeping host. |
-| `MEMORY_EMBED_BREAKER_MS` | `60000` | How long a failed URL is skipped by every process. `0` disables the breaker. The default is a guess. |
-| `MEMORY_EMBED_BREAKER_PATH` | `<tmpdir>/memorygraph-embed-breaker-<uid>.json` | The breaker state file. `<tmpdir>` is `os.tmpdir()`, which is per-user on macOS and `/tmp` on Linux. |
+| `MEMORY_EMBED_TIMEOUT_MS` | `30000` | With one URL, the timeout for each HTTP request. With a list, the total for one embed across every URL tried. |
+| `MEMORY_EMBED_CONNECT_TIMEOUT_MS` | `250` | List only. TCP connect timeout for each URL, checked before any HTTP request. The default is a guess: ample for a 2 ms LAN, not measured against a sleeping host or a cold Tailscale path. |
+| `MEMORY_EMBED_BREAKER_MS` | `60000` | List only. How long a failed URL is skipped by every process. `0` disables the breaker. The default is a guess. |
+| `MEMORY_EMBED_BREAKER_PATH` | `<dir>/memorygraph-embed-breaker-<uid>.json` | List only. The breaker state file. `<dir>` is `$XDG_RUNTIME_DIR` on Linux when set, otherwise `os.tmpdir()` (per-user on macOS). |
 | `MEMORY_DUPLICATE_THRESHOLD` | `0.86` | Cosine at which `store` warns about a possible duplicate. |
 
 Connection messages and `stats` name the server as `host:port/database`. They
@@ -79,8 +79,18 @@ serving a different digest, or returning the wrong dimension:
 ### Embedder failover
 
 `MEMORY_EMBED_URL` is split on commas; whitespace, trailing slashes, empty
-entries and repeated URLs are dropped. A single URL is a one-entry list. On the
-first embed in a process, each URL is tried in order:
+entries and repeated URLs are dropped.
+
+One URL behaves exactly as before the list existed: no connect probe, no
+breaker, no skip line, and the same error text in `embedding_error` and on
+stderr. A cold path (for example over Tailscale) is never cut short by the
+connect timeout.
+
+With two or more URLs, the first embed in a process tries each URL in order,
+and `MEMORY_EMBED_TIMEOUT_MS` is one deadline for the whole chain in that
+embed call. Each later URL gets whatever time is left. If the deadline runs
+out before every URL has been tried, that call fails without latching, and
+the next call tries the untried URLs.
 
 1. A URL whose breaker is open is skipped without any network call.
 2. A TCP connection must open within `MEMORY_EMBED_CONNECT_TIMEOUT_MS`.
@@ -94,13 +104,20 @@ first embed in a process, each URL is tried in order:
 
 A URL that fails any step gets a breaker entry `{until, reason}` in
 `MEMORY_EMBED_BREAKER_PATH`, and every process skips it until `until`
-(`MEMORY_EMBED_BREAKER_MS` after the failure). Each hook call is a new
+(`MEMORY_EMBED_BREAKER_MS` after the failure). An entry whose `until` is
+further ahead than one breaker window (a clock change or a planted value) is
+clamped to one window and written back. A timeout cut short by the deadline
+opens no breaker. Each hook call is a new
 process, so without the file a sleeping host would cost its connect timeout
-on every call. The file is written to a temporary name and renamed. Two
+on every call. The file is written to a temporary name and renamed, and the temporary file
+is removed if the rename fails. Two
 processes that trip different URLs at the same moment can lose one entry; the
 cost is one extra probe. An unreadable or unwritable file is treated as empty
 and never stops embedding. A URL that passes after its entry has expired has
 the entry removed.
+
+Concurrent embed calls in one process share one selection, so they wait for
+it rather than finding every URL already tried.
 
 Only when every URL fails does the embed fail. Then `store` records the
 combined reason (one `<url>: <reason>` per URL) and recall runs full-text only
