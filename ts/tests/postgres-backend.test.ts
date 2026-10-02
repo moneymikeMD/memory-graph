@@ -16,10 +16,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
 
-import { PostgresBackend, buildTsquery, formatEmbeddingPlan, rrf } from "../src/backends/postgres.ts";
+import {
+  DEFAULT_RECALL_FULLTEXT_FLOOR,
+  DEFAULT_RECALL_SIMILARITY_FLOOR,
+  PostgresBackend,
+  buildTsquery,
+  formatEmbeddingPlan,
+  rrf,
+} from "../src/backends/postgres.ts";
 import { OllamaEmbedder, DEFAULT_EMBED_DIMENSION } from "../src/backends/postgres-embedder.ts";
 import { SQLiteBackend } from "../src/backends/sqlite.ts";
 import { MemoryDatabase } from "../src/database.ts";
+import { handleRecallMemories } from "../src/tools/search.ts";
 import { createMemory, type Memory, type SearchQuery } from "../src/models.ts";
 import { exportToJson, importFromJson } from "../src/utils/export-import.ts";
 import { MigrationManager, createMigrationOptions } from "../src/migration/index.ts";
@@ -629,6 +637,205 @@ describe.skipIf(!TEST_URL)("postgres backend (loopback pgvector)", () => {
     const again = await runCli(["migrate", "embedding", "--dry-run"], env);
     expect(again.stdout).toContain("Action: none");
   }, 60_000);
+
+  async function seededCorpus(): Promise<string> {
+    const url = await freshDatabase();
+    const seeded = await openBackend(url);
+    for (const [title, content] of CORPUS) await seeded.storeMemory(mem(title, content));
+    await seeded.disconnect();
+    return url;
+  }
+
+  async function withFloors<T>(
+    url: string,
+    floors: { recallSimilarityFloor?: number; recallFulltextFloor?: number },
+    fn: (b: PostgresBackend) => Promise<T>,
+    emb = embedder()
+  ): Promise<T> {
+    const b = new PostgresBackend({ url, password: PASSWORD, embedder: emb, ...floors });
+    await b.connect();
+    try {
+      return await fn(b);
+    } finally {
+      await b.disconnect();
+    }
+  }
+
+  const NO_FLOOR = { recallSimilarityFloor: 0, recallFulltextFloor: 0 };
+  const ABSENT_TOPIC = "penguin breeding season antarctic";
+
+  test("recall floor: a topic never stored returns nothing; with floors 0 it fills the page", async () => {
+    const url = await seededCorpus();
+    await withFloors(url, {}, async (b) => {
+      expect(b.recallSimilarityFloor).toBe(DEFAULT_RECALL_SIMILARITY_FLOOR);
+      expect(b.recallFulltextFloor).toBe(DEFAULT_RECALL_FULLTEXT_FLOOR);
+      expect(await b.recallMemories(ABSENT_TOPIC, { limit: 5 })).toEqual([]);
+      expect(await b.recallWithFloor(ABSENT_TOPIC, { limit: 5 })).toEqual({
+        memories: [],
+        floor: {
+          candidates: CORPUS.length,
+          dropped: CORPUS.length,
+          similarityFloor: DEFAULT_RECALL_SIMILARITY_FLOOR,
+          fulltextFloor: DEFAULT_RECALL_FULLTEXT_FLOOR,
+        },
+      });
+    });
+    await withFloors(url, NO_FLOOR, async (b) => {
+      const open = await b.recallWithFloor(ABSENT_TOPIC, { limit: 5 });
+      expect(open.memories).toHaveLength(CORPUS.length);
+      expect(open.floor?.dropped).toBe(0);
+    });
+  });
+
+  test("recall floor: returns fewer than the limit, with the raw signals in match_info", async () => {
+    const url = await seededCorpus();
+    await withFloors(url, {}, async (b) => {
+      const hits = await b.recallMemories("caddy tls proxy", { limit: 5 });
+      expect(hits.map((m) => m.title)).toEqual(["Caddy reverse proxy"]);
+      const info = hits[0].match_info!;
+      expect(info["match_quality"]).toBe("hybrid");
+      expect(typeof info["rrf_score"]).toBe("number");
+      expect(info["similarity"] as number).toBeGreaterThan(0.5);
+      expect(info["fulltext_coverage"]).toBe(1);
+    });
+  });
+
+  test("recall floor: a candidate survives on either signal alone", async () => {
+    const url = await seededCorpus();
+    await withFloors(url, { recallSimilarityFloor: 2 }, async (b) => {
+      expect((await b.recallMemories("caddy tls proxy", { limit: 5 })).map((m) => m.title)).toEqual(["Caddy reverse proxy"]);
+      expect(await b.recallMemories("caddy penguin walrus antarctic", { limit: 5 })).toEqual([]);
+    });
+    await withFloors(url, { recallSimilarityFloor: 0.3, recallFulltextFloor: 2 }, async (b) => {
+      const hits = await b.recallMemories("caddy terminates tls for every service", { limit: 5 });
+      expect(hits.map((m) => m.title)).toEqual(["Caddy reverse proxy"]);
+      expect(hits[0].match_info!["similarity"] as number).toBeGreaterThanOrEqual(0.3);
+    });
+  });
+
+  test("recall floor: the full-text-only fallback applies the full-text floor", async () => {
+    const url = await seededCorpus();
+    const down = () => embedder("http://127.0.0.1:1");
+    const diluted = "caddy penguin walrus antarctic";
+    await captureStderr(async () => {
+      await withFloors(url, {}, async (b) => {
+        const hits = await b.recallMemories("caddy tls", { limit: 5 });
+        expect(hits.map((m) => m.title)).toEqual(["Caddy reverse proxy"]);
+        expect(hits[0].match_info).toMatchObject({ match_quality: "fulltext", similarity: null, fulltext_coverage: 1 });
+        const floored = await b.recallWithFloor(diluted, { limit: 5 });
+        expect(floored.memories).toEqual([]);
+        expect(floored.floor).toMatchObject({ dropped: 1, similarityFloor: null });
+      }, down());
+      for (const floors of [{ recallFulltextFloor: 0 }, { recallSimilarityFloor: 0 }]) {
+        await withFloors(url, floors, async (b) => {
+          expect((await b.recallMemories(diluted, { limit: 5 })).map((m) => m.title)).toEqual(["Caddy reverse proxy"]);
+        }, down());
+      }
+    });
+  });
+
+  test("recall floor: floor 0 on either signal reproduces the pre-floor ranking", async () => {
+    const url = await seededCorpus();
+    const preFloor = (q: string, limit: number) =>
+      withClient(url, async (c) => {
+        const tsq = buildTsquery(q, " | ");
+        const fulltext = tsq
+          ? await c.unsafe(
+              `SELECT id, ts_rank(search_vector, to_tsquery('english', $1)) AS score FROM memories
+               WHERE search_vector @@ to_tsquery('english', $1) ORDER BY score DESC, id LIMIT 50`,
+              [tsq]
+            )
+          : [];
+        const vec = `[${stubVector(q.toLowerCase()).join(",")}]`;
+        const vector = await c.unsafe(
+          `SELECT id, 1 - (embedding <=> $1::halfvec) AS score FROM memories
+           WHERE embedding IS NOT NULL ORDER BY embedding <=> $1::halfvec, id LIMIT 50`,
+          [vec]
+        );
+        const ranked = (rows: readonly Record<string, unknown>[]) => rows.map((r) => ({ id: r["id"] as string, score: Number(r["score"]) }));
+        return rrf([ranked(fulltext), ranked(vector)]).slice(0, limit);
+      });
+
+    const preFloorFulltext = (q: string, limit: number) =>
+      withClient(url, async (c) => {
+        const rows = await c.unsafe(
+          `SELECT id, ts_rank(search_vector, to_tsquery('english', $1)) AS score FROM memories
+           WHERE search_vector @@ to_tsquery('english', $1) ORDER BY score DESC, id LIMIT $2`,
+          [buildTsquery(q, " | ")!, limit]
+        );
+        return rows.map((r) => ({ id: r["id"] as string, score: Number(r["score"]) }));
+      });
+    const manyMatches = "caddy tls homelab pgvector hnsw dimensions embedder digest penguin walrus";
+
+    for (const floors of [NO_FLOOR, { recallSimilarityFloor: 0 }, { recallFulltextFloor: 0 }]) {
+      await withFloors(url, floors, async (b) => {
+        for (const q of [...QUERIES, ABSENT_TOPIC, "caddy penguin walrus antarctic"]) {
+          const expected = await preFloor(q, 3);
+          const got = await b.recallMemories(q, { limit: 3 });
+          expect(got.map((m) => m.id)).toEqual(expected.map((r) => r.id));
+          expect(got.map((m) => m.match_info!["rrf_score"])).toEqual(expected.map((r) => r.score));
+        }
+      });
+      await captureStderr(() =>
+        withFloors(url, floors, async (b) => {
+          for (const [q, limit] of [[manyMatches, 5], [manyMatches, 2], ["caddy penguin walrus antarctic", 5]] as const) {
+            const expected = await preFloorFulltext(q, limit);
+            const got = await b.recallMemories(q, { limit });
+            expect(got.map((m) => m.id)).toEqual(expected.map((r) => r.id));
+            expect(got.map((m) => m.match_info!["rrf_score"])).toEqual(expected.map((r) => r.score));
+          }
+          expect(await preFloorFulltext(manyMatches, 5)).toHaveLength(3);
+        }, embedder("http://127.0.0.1:1"))
+      );
+    }
+  });
+
+  test("recall floor: an empty recall opens with the sentence night-watchman parses, hybrid and fallback", async () => {
+    const url = await seededCorpus();
+    const consumer =
+      "night-watchman providers/memory/memorygraph/recall.sh accepts an empty recall only when it opens with this sentence";
+    await withFloors(url, {}, async (b) => {
+      const out = await handleRecallMemories(new MemoryDatabase(b), { query: ABSENT_TOPIC, limit: 5 });
+      expect(out.text.startsWith("No memories found matching your query. No memories cleared the relevance floor:"), consumer).toBe(true);
+      expect(out.text).toContain("similarity 0.58 or full-text coverage 0.5");
+    });
+    await captureStderr(() =>
+      withFloors(url, {}, async (b) => {
+        const out = await handleRecallMemories(new MemoryDatabase(b), { query: "caddy penguin walrus antarctic", limit: 5 });
+        expect(out.text.startsWith("No memories found matching your query. No memories cleared the relevance floor:"), consumer).toBe(true);
+        expect(out.text).toContain("none reached full-text coverage 0.5");
+        const nothing = await handleRecallMemories(new MemoryDatabase(b), { query: "penguin", limit: 5 });
+        expect(nothing.text.startsWith("No memories found matching your query. Try:"), consumer).toBe(true);
+      }, embedder("http://127.0.0.1:1"))
+    );
+  });
+
+  test("CLI: recall says when nothing clears the floor; the floors come from the environment", async () => {
+    const url = await seededCorpus();
+    const env = {
+      MEMORY_BACKEND: "postgres",
+      MEMORY_POSTGRES_URL: url,
+      MEMORY_POSTGRES_PASSWORD: PASSWORD ?? "",
+      MEMORY_EMBED_URL: stub.url,
+      MEMORY_EMBED_DIGEST: STUB_DIGEST,
+    };
+    const floored = await runCli(["recall", "--query", ABSENT_TOPIC, "--limit", "5"], env);
+    expect(floored.code).toBe(0);
+    expect(floored.stdout).toContain("No memories found matching your query. No memories cleared the relevance floor");
+    expect(floored.stdout).toContain("similarity 0.58 or full-text coverage 0.5");
+    expect(floored.stdout).not.toContain("relevant memories");
+
+    const open = await runCli(["recall", "--query", ABSENT_TOPIC, "--limit", "5"], {
+      ...env,
+      MEMORY_RECALL_SIMILARITY_FLOOR: "0",
+      MEMORY_RECALL_FULLTEXT_FLOOR: "0",
+    });
+    expect(open.stdout).toContain(`Found ${CORPUS.length} relevant memories`);
+
+    const hit = await runCli(["recall", "--query", "caddy tls proxy", "--limit", "5"], env);
+    expect(hit.stdout).toContain("**Found 1 relevant memories");
+    expect(hit.stdout).toMatch(/Match: hybrid quality, similarity \d\.\d\d, full-text coverage 1\.00/);
+  });
 
   test("duplicate check warns with the nearest match, logs it, and still stores", async () => {
     const original = await backend.storeMemory(

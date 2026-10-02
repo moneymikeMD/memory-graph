@@ -21,6 +21,7 @@ import {
   DatabaseConnectionError,
 } from "./errors.ts";
 import type { GraphBackend } from "./backends/index.ts";
+import type { RecallResult } from "./backends/base.ts";
 import { createRelationshipProperties } from "./models.ts";
 
 /**
@@ -82,6 +83,11 @@ export interface IMemoryDatabase {
     query: string,
     opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
   ): Promise<Memory[]>;
+
+  recallWithFloor?(
+    query: string,
+    opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
+  ): Promise<RecallResult>;
 
   // H7 temporal (VAL-LOCAL-017..019): minimal memory versioning.
   getMemoryStateAt?(memoryId: string, timestamp: Date): Promise<Memory | null>;
@@ -214,6 +220,14 @@ export class MemoryDatabase implements IMemoryDatabase {
       return this.backend.getRelationshipsSince(since);
     }
     return [];
+  }
+
+  async recallWithFloor(
+    query: string,
+    opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
+  ): Promise<RecallResult> {
+    if (this.backend.recallWithFloor) return this.backend.recallWithFloor(query, opts);
+    return { memories: await this.recallMemories(query, opts), floor: null };
   }
 
   /**

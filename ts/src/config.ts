@@ -125,6 +125,13 @@ function envFloat(names: string[], fallback: number): number {
   return Number.isNaN(n) ? fallback : n;
 }
 
+function envFloor(name: string): number | undefined {
+  const raw = env([name]);
+  if (raw === undefined) return undefined;
+  const n = Number.parseFloat(raw);
+  return Number.isNaN(n) ? undefined : n;
+}
+
 function envBool(names: string[], fallback: boolean): boolean {
   const raw = env(names);
   if (raw === undefined) return fallback;
@@ -294,6 +301,13 @@ export class Config {
     if (raw === undefined) return undefined;
     const n = Number.parseFloat(raw);
     return Number.isNaN(n) ? undefined : n;
+  }
+
+  static get RECALL_SIMILARITY_FLOOR(): number | undefined {
+    return envFloor("MEMORY_RECALL_SIMILARITY_FLOOR");
+  }
+  static get RECALL_FULLTEXT_FLOOR(): number | undefined {
+    return envFloor("MEMORY_RECALL_FULLTEXT_FLOOR");
   }
 
   static get QUERY_TIMEOUT(): number {

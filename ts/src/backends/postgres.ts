@@ -22,7 +22,7 @@ import {
   isRelationshipType,
   ALL_RELATIONSHIP_TYPES,
 } from "../models.ts";
-import type { GraphBackend, HealthCheckResult } from "./base.ts";
+import type { GraphBackend, HealthCheckResult, RecallFloorReport, RecallResult } from "./base.ts";
 import { DatabaseConnectionError, RelationshipError, ValidationError } from "../errors.ts";
 import {
   EmbedderUnavailableError,
@@ -39,6 +39,14 @@ import {
  */
 export const DEFAULT_DUPLICATE_THRESHOLD = 0.86;
 
+/**
+ * Recall relevance floors, measured on the frozen bench corpus (LAB-426);
+ * method and numbers in docs/recall-floor.md. A recall candidate survives
+ * when its cosine similarity or its full-text coverage clears its floor.
+ */
+export const DEFAULT_RECALL_SIMILARITY_FLOOR = 0.58;
+export const DEFAULT_RECALL_FULLTEXT_FLOOR = 0.5;
+
 const RRF_K = 60;
 const MAX_QUERY_TERMS = 32;
 const TSQUERY_UNSAFE = /[&|!()<>\\:*'"@~^{}[\]]/g;
@@ -52,6 +60,13 @@ export interface PostgresBackendOptions {
   password?: string;
   embedder?: OllamaEmbedder;
   duplicateThreshold?: number;
+  recallSimilarityFloor?: number;
+  recallFulltextFloor?: number;
+}
+
+interface RelevanceSignals {
+  similarity: number | null;
+  coverage: number;
 }
 
 export interface DuplicateMatch {
@@ -92,6 +107,8 @@ type Tx = postgres.TransactionSql;
 export class PostgresBackend implements GraphBackend {
   readonly embedder: OllamaEmbedder;
   readonly duplicateThreshold: number;
+  readonly recallSimilarityFloor: number;
+  readonly recallFulltextFloor: number;
   /** Set by the `store` command only, so import and migrate do not log duplicate events. */
   duplicateCheck = false;
   lastDuplicate: DuplicateMatch | null = null;
@@ -125,6 +142,10 @@ export class PostgresBackend implements GraphBackend {
       });
     this.duplicateThreshold =
       opts.duplicateThreshold ?? Config.DUPLICATE_THRESHOLD ?? DEFAULT_DUPLICATE_THRESHOLD;
+    this.recallSimilarityFloor =
+      opts.recallSimilarityFloor ?? Config.RECALL_SIMILARITY_FLOOR ?? DEFAULT_RECALL_SIMILARITY_FLOOR;
+    this.recallFulltextFloor =
+      opts.recallFulltextFloor ?? Config.RECALL_FULLTEXT_FLOOR ?? DEFAULT_RECALL_FULLTEXT_FLOOR;
   }
 
   /** host:port/database of the server, never including credentials. */
@@ -440,27 +461,50 @@ export class PostgresBackend implements GraphBackend {
     return rows.map(rowToMemory).filter((m): m is Memory => m !== null);
   }
 
-  /**
-   * Hybrid recall: full-text and vector rankings fused by RRF. Falls back to
-   * full-text only, with a note on stderr, when the query cannot be embedded.
-   */
   async recallMemories(
     query: string,
     opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
   ): Promise<Memory[]> {
+    return (await this.recallWithFloor(query, opts)).memories;
+  }
+
+  /**
+   * Hybrid recall: full-text and vector rankings fused by RRF, then cut by the
+   * relevance floor, so it may return fewer than the limit or nothing. Falls
+   * back to full-text only, with a note on stderr, when the query cannot be embedded.
+   */
+  async recallWithFloor(
+    query: string,
+    opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
+  ): Promise<RecallResult> {
     const limit = Math.max(1, Math.trunc(opts?.limit ?? 20));
     const { vectors, error } = await this.tryEmbed([queryEmbedText(query)]);
     if (error && !this.warnedFulltextOnly) {
       console.error(`memorygraph: recall is full-text only: the query could not be embedded (${error})`);
       this.warnedFulltextOnly = true;
     }
-    const ranked = await this.hybridRank(
+    const vector = vectors?.[0] ?? null;
+    const candidates = await this.fusedCandidates(
       query,
-      vectors?.[0] ?? null,
+      vector,
       { memoryTypes: opts?.memoryTypes, projectPath: opts?.projectPath },
       limit
     );
-    if (ranked.length === 0) return [];
+    // A floor of 0 on either variable turns the floor off in both modes, which is the pre-floor ranking.
+    const floorActive = this.recallSimilarityFloor > 0 && this.recallFulltextFloor > 0;
+    const scored = floorActive ? candidates : candidates.slice(0, limit);
+    const signals = await this.relevanceSignals(query, vector, scored.map((r) => r.id));
+    const survivors = floorActive
+      ? scored.filter((r) => this.clearsFloor(signals.get(r.id), vector !== null))
+      : scored;
+    const ranked = survivors.slice(0, limit);
+    const floor: RecallFloorReport = {
+      candidates: candidates.length,
+      dropped: scored.length - survivors.length,
+      similarityFloor: vector ? this.recallSimilarityFloor : null,
+      fulltextFloor: this.recallFulltextFloor,
+    };
+    if (ranked.length === 0) return { memories: [], floor };
     const rows = await this.db()`
       SELECT ${this.db().unsafe(MEMORY_COLUMNS)} FROM memories WHERE id = ANY(${ranked.map((r) => r.id)}::text[])`;
     const byId = new Map(rows.map((r) => [r["id"] as string, r]));
@@ -469,11 +513,17 @@ export class PostgresBackend implements GraphBackend {
       const row = byId.get(r.id);
       const mem = row ? rowToMemory(row) : null;
       if (mem) {
-        mem.match_info = { match_quality: vectors ? "hybrid" : "fulltext", rrf_score: r.score };
+        const s = signals.get(r.id);
+        mem.match_info = {
+          match_quality: vector ? "hybrid" : "fulltext",
+          rrf_score: r.score,
+          similarity: s?.similarity ?? null,
+          fulltext_coverage: s?.coverage ?? 0,
+        };
         out.push(mem);
       }
     }
-    return out;
+    return { memories: out, floor };
   }
 
   private async hybridRank(
@@ -482,11 +532,66 @@ export class PostgresBackend implements GraphBackend {
     filters: { memoryTypes?: string[]; projectPath?: string; excludeId?: string },
     limit: number
   ): Promise<RankedId[]> {
+    return (await this.fusedCandidates(text, vector, filters, limit)).slice(0, limit);
+  }
+
+  private async fusedCandidates(
+    text: string,
+    vector: number[] | null,
+    filters: { memoryTypes?: string[]; projectPath?: string; excludeId?: string },
+    limit: number
+  ): Promise<RankedId[]> {
     const overFetch = Math.max(limit * 4, 50);
     const fulltext = await this.fulltextRank(text, filters, overFetch);
-    if (!vector) return fulltext.slice(0, limit);
+    if (!vector) return fulltext;
     const vec = await this.vectorRank(vector, filters, overFetch);
-    return rrf([fulltext, vec]).slice(0, limit);
+    return rrf([fulltext, vec]);
+  }
+
+  private clearsFloor(signals: RelevanceSignals | undefined, hybrid: boolean): boolean {
+    if (!signals) return false;
+    if (signals.coverage >= this.recallFulltextFloor) return true;
+    return hybrid && signals.similarity !== null && signals.similarity >= this.recallSimilarityFloor;
+  }
+
+  /**
+   * Raw relevance of each candidate to the query: cosine similarity, and the
+   * share of the query's lexemes the memory contains, each lexeme weighted by
+   * its BM25 inverse document frequency so a match on a rare term counts for more.
+   */
+  private async relevanceSignals(
+    text: string,
+    vector: number[] | null,
+    ids: string[]
+  ): Promise<Map<string, RelevanceSignals>> {
+    const out = new Map<string, RelevanceSignals>();
+    if (ids.length === 0) return out;
+    const tsq = buildTsquery(text, " | ");
+    const lexemeText = tsq ? tsq.split(" | ").join(" ") : "";
+    const similarity = vector ? `1 - (m.embedding <=> $3::${this.columnType})` : "NULL::float8";
+    const params: unknown[] = [lexemeText, ids];
+    if (vector) params.push(vectorLiteral(vector));
+    const rows = await this.db().unsafe(
+      `WITH df AS (
+         SELECT l AS lexeme, ln(1 + (n.n - d.df + 0.5) / (d.df + 0.5)) AS idf
+         FROM unnest(tsvector_to_array(to_tsvector('english', $1))) AS l,
+              LATERAL (SELECT count(*)::float8 AS n FROM memories) n,
+              LATERAL (SELECT count(*)::float8 AS df FROM memories x
+                       WHERE x.search_vector @@ quote_literal(l)::tsquery) d
+       )
+       SELECT m.id, ${similarity} AS similarity,
+              coalesce((SELECT sum(df.idf) FROM df WHERE m.search_vector @@ quote_literal(df.lexeme)::tsquery), 0)
+                / nullif((SELECT sum(df.idf) FROM df), 0) AS coverage
+       FROM memories m WHERE m.id = ANY($2::text[])`,
+      params as never[]
+    );
+    for (const r of rows) {
+      out.set(r["id"] as string, {
+        similarity: r["similarity"] === null || r["similarity"] === undefined ? null : Number(r["similarity"]),
+        coverage: Number(r["coverage"] ?? 0),
+      });
+    }
+    return out;
   }
 
   private async fulltextRank(
