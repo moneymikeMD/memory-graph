@@ -31,6 +31,8 @@ and a pgvector cosine ranking fused by reciprocal-rank fusion (k = 60).
 | `MEMORY_EMBED_BREAKER_MS` | `60000` | List only. How long a failed URL is skipped by every process. `0` disables the breaker. The default is a guess. |
 | `MEMORY_EMBED_BREAKER_PATH` | `<dir>/memorygraph-embed-breaker-<uid>.json` | List only. The breaker state file. `<dir>` is `$XDG_RUNTIME_DIR` on Linux when set, otherwise `os.tmpdir()` (per-user on macOS). |
 | `MEMORY_DUPLICATE_THRESHOLD` | `0.86` | Cosine at which `store` warns about a possible duplicate. |
+| `MEMORY_RECALL_SIMILARITY_FLOOR` | `0.58` | Cosine a recall result must reach, unless its full-text coverage clears its own floor. `0` disables the floor. See Relevance floor. |
+| `MEMORY_RECALL_FULLTEXT_FLOOR` | `0.5` | IDF-weighted share of the query's terms a recall result must contain, unless its cosine clears its own floor. `0` disables the floor. |
 
 Connection messages and `stats` name the server as `host:port/database`. They
 never print the password.
@@ -131,10 +133,32 @@ and reports `match_quality: "fulltext"` instead of `"hybrid"`.
    terms, so this arm ignores case on its own.
 2. The vector arm embeds the lower-cased query and ranks by cosine.
 3. Both arms over-fetch `max(4 × limit, 50)` rows and are fused by RRF.
+4. The relevance floor drops every fused candidate that clears neither the
+   similarity floor nor the full-text floor. The survivors keep their fused
+   order and are cut to the limit.
 
 When the query cannot be embedded, recall uses the full-text arm alone, sets
 each result's `match_quality` to `fulltext`, and says so once on stderr:
 `recall is full-text only: the query could not be embedded (<reason>)`.
+
+### Relevance floor
+
+Recall can return fewer results than the limit, or none. A candidate survives
+when its cosine similarity reaches `MEMORY_RECALL_SIMILARITY_FLOOR` or its
+full-text coverage reaches `MEMORY_RECALL_FULLTEXT_FLOOR`. Coverage is the
+share of the query's lexemes the memory contains, weighted by BM25 inverse
+document frequency. In the full-text-only fallback only the coverage floor
+applies. A floor of `0` on either variable passes everything, which is the
+ranking before LAB-426.
+
+Each result's `match_info` carries `similarity` and `fulltext_coverage` next
+to `rrf_score`. When candidates existed and none cleared the floor, the CLI
+prints `No memories cleared the relevance floor: …`.
+
+The defaults were measured on the frozen bench corpus: 45 of 48 off-topic
+queries return nothing, and gold-set recall@5 moves from 0.9613 to 0.9774.
+[`../recall-floor.md`](../recall-floor.md) has the distributions, the
+trade-off curve and the scripts.
 
 ### Deviations
 

@@ -318,6 +318,8 @@ ENVIRONMENT VARIABLES:
   MEMORY_EMBED_BREAKER_MS     URL list only: how long a failed URL is skipped; 0 disables [default: 60000]
   MEMORY_EMBED_BREAKER_PATH   URL list only: breaker state file [default: <dir>/memorygraph-embed-breaker-<uid>.json, <dir> = $XDG_RUNTIME_DIR on Linux, else the OS temp dir]
   MEMORY_DUPLICATE_THRESHOLD  Cosine at which store warns of a possible duplicate [default: 0.86]
+  MEMORY_RECALL_SIMILARITY_FLOOR  Postgres recall: cosine a result must reach, unless its full-text coverage clears its floor; 0 disables [default: 0.58]
+  MEMORY_RECALL_FULLTEXT_FLOOR    Postgres recall: IDF-weighted share of query terms a result must match, unless its cosine clears its floor; 0 disables [default: 0.5]
   MEMORYGRAPH_API_KEY         API key for cloud backend
   MEMORYGRAPH_API_URL         Cloud API URL [default: https://graph-api.memorygraph.dev]
   MEMORY_TOOL_PROFILE         Tool profile (core|extended) [default: core]

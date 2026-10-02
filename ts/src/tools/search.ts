@@ -6,6 +6,7 @@
 
 import type { IMemoryDatabase } from "../database.ts";
 import type { SearchQuery, Memory } from "../models.ts";
+import type { RecallFloorReport } from "../backends/postgres.ts";
 import { validateSearchInput } from "../utils/validation.ts";
 import { handleToolErrors, neverThrowBoundary } from "./error-handling.ts";
 
@@ -104,6 +105,14 @@ const _handleRecallMemories = handleToolErrors(
         }));
 
     if (memories.length === 0) {
+      const floor = (db as { backend?: { lastRecallFloor?: RecallFloorReport | null } }).backend?.lastRecallFloor;
+      if (floor && floor.dropped > 0) {
+        const similarity = floor.similarityFloor === null ? "" : `similarity ${floor.similarityFloor} or `;
+        return (
+          `No memories cleared the relevance floor: ${floor.dropped} candidates matched loosely, ` +
+          `none reached ${similarity}full-text coverage ${floor.fulltextFloor}. No stored memory is close enough to count as a match.`
+        );
+      }
       return "No memories found matching your query. Try:\n- Using different search terms\n- Removing filters to broaden the search\n- Checking if memories have been stored for this topic";
     }
 
@@ -118,6 +127,12 @@ const _handleRecallMemories = handleToolErrors(
         const quality = matchInfo["match_quality"] ?? "unknown";
         const matchedFields = matchInfo["matched_fields"] as string[];
         text += `Match: ${quality} quality`;
+        const signals: string[] = [];
+        if (typeof matchInfo["similarity"] === "number") signals.push(`similarity ${matchInfo["similarity"].toFixed(2)}`);
+        if (typeof matchInfo["fulltext_coverage"] === "number") {
+          signals.push(`full-text coverage ${matchInfo["fulltext_coverage"].toFixed(2)}`);
+        }
+        if (signals.length > 0) text += `, ${signals.join(", ")}`;
         if (Array.isArray(matchedFields) && matchedFields.length > 0) {
           text += ` (in ${matchedFields.join(", ")})`;
         }
