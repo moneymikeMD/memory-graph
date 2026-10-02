@@ -304,10 +304,21 @@ at least 80% of ordinary prompts return nothing.
 The keyword column is a third population, added because every rule that helps
 ordinary prompts acts on short queries. It is the 202 single-word queries in
 [`recall-floor/keyword-queries.jsonl`](recall-floor/keyword-queries.jsonl):
-every corpus tag of four or more letters carried by 4 to 40 memories, minus 22
-generic labels such as `fix` and `decision`. A single keyword is a normal
-deliberate recall ("docker", "caddy"), and the hook's per-word split sends
-single words too. With the shipped floor all 202 return something.
+built from the corpus tags as follows. Take every tag carried by 4 to 40
+memories that matches `^[a-z][a-z0-9]{3,}$` (a letter, then three or more
+letters or digits, so no hyphens). That gives 207 tags: 206 alphabetic ones
+and `agento11y`. Remove the five that are labels for a kind of memory and not
+a topic: `config`, `docs`, `feature`, `footgun` and `process`. The other
+labels of that kind (`fix`, `decision`, `gotcha` and so on) fall outside the
+4-to-40 band already. The file lists the 202 that remain, in alphabetical
+order.
+
+A single keyword is a normal deliberate recall ("docker", "caddy") when
+someone types one. How often that happens is not measured. The night-watchman
+hook does not produce single-word recalls on Postgres: `memory-push.py` sends
+the whole prompt, and `recall.sh` splits a query into words only on the
+falkordb and falkordblite backends. With the shipped floor all 202 return
+something.
 
 | rule | recall@5 hooks (pp) | recall@5 model queries (pp) | negatives returning 0 | ordinary returning 0 | ordinary returning a full page | keyword queries returning 0 | both targets | ordinary >= 80% |
 |---|---|---|---|---|---|---|---|---|
@@ -352,26 +363,36 @@ Reading the table:
 - Rules exist that meet the bar. `W 0.55, G 0.48` returns nothing for 53 of 64
   ordinary prompts (83%), silences all 48 negatives, and leaves recall@5 where
   the shipped floor has it.
-- Every rule that meets the bar also silences about half or more of the
-  single-keyword queries: 113 of 202 (56%) at `W 0.55, G 0.48`, and never
-  fewer than 113 among the rules that pass. The queries that stop returning
-  anything include `docker`, `postgres`, `proxmox`, `bash`, `lint`, `deploy`,
-  `macos`, `network` and `migration`.
-- The two populations cannot be separated with these signals. "commit this"
-  reduces to the lexeme `commit`; so does the keyword query "commit". Both
-  have coverage 1.00, a low match weight and a cosine near 0.55.
+- Every rule in this table that meets the bar also silences more than half of
+  the single-keyword queries. The fewest is 113 of 202 (56%), at
+  `W 0.55, G 0.48`. The queries that stop returning anything include `docker`,
+  `postgres`, `proxmox`, `bash`, `lint`, `deploy`, `macos`, `network` and
+  `migration`. The table covers 30 rules of one family. The spec review ran a
+  wider sweep of 44,352 rules, with separate weights for the two arms and a
+  lexeme-count gate, and reports the fewest keywords lost at 80% of ordinary
+  prompts silenced, with both targets held, as 92 of 202 (46%). That number
+  is the review's and was not measured here.
+- These signals separate the two populations poorly. "commit this" reduces to the lexeme `commit`, and so does the keyword
+  query "commit", so both have coverage 1.00 and the same match weight; only
+  the cosine can differ. `commit` is not in the committed keyword set. The
+  spec review measured the pair separately and reports best cosines of 0.599
+  and 0.595. Over the whole sets the review reports that best cosine
+  separates ordinary prompts from keyword queries with an AUC of 0.81, so a
+  rule can trade one population against the other but none in this table
+  keeps both.
 
 **No rule was adopted, and the defaults are unchanged.** A rule met the bar
 that was set for adoption, so this is a deliberate departure from the fix
 brief, made because the brief's bar did not include keyword recall. Recall
-that answers "nothing stored" for `docker` is the failure the ticket warns
-about in the other direction: agents are told to recall before saying
+that answers "nothing stored" for a typed `docker` is the failure the ticket
+warns about in the other direction: agents are told to recall before saying
 something is absent. The owner chooses between:
 
 1. **Leave the floor as shipped.** Off-topic questions are handled; ordinary
    prompts are not.
 2. **Adopt a `W`/`G` rule.** Ordinary prompts are mostly handled; about half
-   of single-keyword recalls return nothing.
+   of single-keyword recalls return nothing (56% for the best rule here, 46%
+   for the best in the review's wider sweep).
 3. **Gate on the caller's side.** The hook knows it is sending a chat prompt
    and not a deliberate query. All 64 ordinary prompts have at most 3
    lexemes; of the 140 gold and model queries, 2 have exactly 3 and 2 are
@@ -451,6 +472,9 @@ bun run tests/recall-floor/evaluate.ts $BENCH $SETS/negative-queries.jsonl \
   $SETS/ordinary-prompts.jsonl $SETS/keyword-queries.jsonl
 docker rm -f recall-floor-pg
 ```
+
+`evaluate.ts` exits 0 whatever the numbers are. It does not check them
+against the targets, so the table it prints is the result.
 
 ## Negative queries: best candidate per query
 
