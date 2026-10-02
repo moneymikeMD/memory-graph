@@ -22,7 +22,7 @@ import {
   isRelationshipType,
   ALL_RELATIONSHIP_TYPES,
 } from "../models.ts";
-import type { GraphBackend, HealthCheckResult } from "./base.ts";
+import type { GraphBackend, HealthCheckResult, RecallFloorReport, RecallResult } from "./base.ts";
 import { DatabaseConnectionError, RelationshipError, ValidationError } from "../errors.ts";
 import {
   EmbedderUnavailableError,
@@ -62,14 +62,6 @@ export interface PostgresBackendOptions {
   duplicateThreshold?: number;
   recallSimilarityFloor?: number;
   recallFulltextFloor?: number;
-}
-
-/** What the relevance floor did to the last recall. */
-export interface RecallFloorReport {
-  candidates: number;
-  dropped: number;
-  similarityFloor: number | null;
-  fulltextFloor: number;
 }
 
 interface RelevanceSignals {
@@ -117,8 +109,6 @@ export class PostgresBackend implements GraphBackend {
   readonly duplicateThreshold: number;
   readonly recallSimilarityFloor: number;
   readonly recallFulltextFloor: number;
-  /** Set by every recall; null before the first one. */
-  lastRecallFloor: RecallFloorReport | null = null;
   /** Set by the `store` command only, so import and migrate do not log duplicate events. */
   duplicateCheck = false;
   lastDuplicate: DuplicateMatch | null = null;
@@ -471,15 +461,22 @@ export class PostgresBackend implements GraphBackend {
     return rows.map(rowToMemory).filter((m): m is Memory => m !== null);
   }
 
+  async recallMemories(
+    query: string,
+    opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
+  ): Promise<Memory[]> {
+    return (await this.recallWithFloor(query, opts)).memories;
+  }
+
   /**
    * Hybrid recall: full-text and vector rankings fused by RRF, then cut by the
    * relevance floor, so it may return fewer than the limit or nothing. Falls
    * back to full-text only, with a note on stderr, when the query cannot be embedded.
    */
-  async recallMemories(
+  async recallWithFloor(
     query: string,
     opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
-  ): Promise<Memory[]> {
+  ): Promise<RecallResult> {
     const limit = Math.max(1, Math.trunc(opts?.limit ?? 20));
     const { vectors, error } = await this.tryEmbed([queryEmbedText(query)]);
     if (error && !this.warnedFulltextOnly) {
@@ -493,23 +490,21 @@ export class PostgresBackend implements GraphBackend {
       { memoryTypes: opts?.memoryTypes, projectPath: opts?.projectPath },
       limit
     );
-    // A floor of 0 on either signal passes every candidate, which is the pre-floor ranking.
-    const floorActive = vector
-      ? this.recallSimilarityFloor > 0 && this.recallFulltextFloor > 0
-      : this.recallFulltextFloor > 0;
+    // A floor of 0 on either variable turns the floor off in both modes, which is the pre-floor ranking.
+    const floorActive = this.recallSimilarityFloor > 0 && this.recallFulltextFloor > 0;
     const scored = floorActive ? candidates : candidates.slice(0, limit);
     const signals = await this.relevanceSignals(query, vector, scored.map((r) => r.id));
     const survivors = floorActive
       ? scored.filter((r) => this.clearsFloor(signals.get(r.id), vector !== null))
       : scored;
     const ranked = survivors.slice(0, limit);
-    this.lastRecallFloor = {
+    const floor: RecallFloorReport = {
       candidates: candidates.length,
       dropped: scored.length - survivors.length,
       similarityFloor: vector ? this.recallSimilarityFloor : null,
       fulltextFloor: this.recallFulltextFloor,
     };
-    if (ranked.length === 0) return [];
+    if (ranked.length === 0) return { memories: [], floor };
     const rows = await this.db()`
       SELECT ${this.db().unsafe(MEMORY_COLUMNS)} FROM memories WHERE id = ANY(${ranked.map((r) => r.id)}::text[])`;
     const byId = new Map(rows.map((r) => [r["id"] as string, r]));
@@ -528,7 +523,7 @@ export class PostgresBackend implements GraphBackend {
         out.push(mem);
       }
     }
-    return out;
+    return { memories: out, floor };
   }
 
   private async hybridRank(

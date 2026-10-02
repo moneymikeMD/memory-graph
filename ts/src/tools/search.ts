@@ -6,7 +6,6 @@
 
 import type { IMemoryDatabase } from "../database.ts";
 import type { SearchQuery, Memory } from "../models.ts";
-import type { RecallFloorReport } from "../backends/postgres.ts";
 import { validateSearchInput } from "../utils/validation.ts";
 import { handleToolErrors, neverThrowBoundary } from "./error-handling.ts";
 
@@ -56,6 +55,9 @@ const _handleSearchMemories = handleToolErrors(
 );
 export const handleSearchMemories = neverThrowBoundary("search memories", _handleSearchMemories);
 
+// night-watchman's memorygraph provider recognises an empty recall by this opening sentence.
+const NO_RECALL_MATCH = "No memories found matching your query.";
+
 const _handleRecallMemories = handleToolErrors(
   "recall memories",
   async (db: IMemoryDatabase, args: Record<string, unknown>): Promise<string> => {
@@ -77,12 +79,13 @@ const _handleRecallMemories = handleToolErrors(
       limit: (args["limit"] as number) ?? 20,
     };
 
-    const memories = await (db.recallMemories
-      ? db.recallMemories(opts.query ?? "", {
-          memoryTypes: opts.memoryTypes,
-          projectPath: opts.projectPath,
-          limit: opts.limit,
-        })
+    const recallOpts = { memoryTypes: opts.memoryTypes, projectPath: opts.projectPath, limit: opts.limit };
+    const recalled = db.recallWithFloor ? await db.recallWithFloor(opts.query ?? "", recallOpts) : null;
+    const floor = recalled?.floor ?? null;
+    const memories = recalled
+      ? recalled.memories
+      : await (db.recallMemories
+      ? db.recallMemories(opts.query ?? "", recallOpts)
       : db.searchMemories({
           query,
           terms: [],
@@ -105,15 +108,14 @@ const _handleRecallMemories = handleToolErrors(
         }));
 
     if (memories.length === 0) {
-      const floor = (db as { backend?: { lastRecallFloor?: RecallFloorReport | null } }).backend?.lastRecallFloor;
       if (floor && floor.dropped > 0) {
         const similarity = floor.similarityFloor === null ? "" : `similarity ${floor.similarityFloor} or `;
         return (
-          `No memories cleared the relevance floor: ${floor.dropped} candidates matched loosely, ` +
+          `${NO_RECALL_MATCH} No memories cleared the relevance floor: ${floor.dropped} candidates matched loosely, ` +
           `none reached ${similarity}full-text coverage ${floor.fulltextFloor}. No stored memory is close enough to count as a match.`
         );
       }
-      return "No memories found matching your query. Try:\n- Using different search terms\n- Removing filters to broaden the search\n- Checking if memories have been stored for this topic";
+      return NO_RECALL_MATCH + " Try:\n- Using different search terms\n- Removing filters to broaden the search\n- Checking if memories have been stored for this topic";
     }
 
     let text = `**Found ${memories.length} relevant memories:**\n\n`;

@@ -147,18 +147,21 @@ Recall can return fewer results than the limit, or none. A candidate survives
 when its cosine similarity reaches `MEMORY_RECALL_SIMILARITY_FLOOR` or its
 full-text coverage reaches `MEMORY_RECALL_FULLTEXT_FLOOR`. Coverage is the
 share of the query's lexemes the memory contains, weighted by BM25 inverse
-document frequency. In the full-text-only fallback only the coverage floor
-applies. A floor of `0` on either variable passes everything, which is the
-ranking before LAB-426.
+document frequency. In the full-text-only fallback there is no similarity, so
+only the coverage floor is applied. A floor of `0` on either variable turns
+the floor off in both modes, which is the ranking before LAB-426.
 
 Each result's `match_info` carries `similarity` and `fulltext_coverage` next
 to `rrf_score`. When candidates existed and none cleared the floor, the CLI
-prints `No memories cleared the relevance floor: …`.
+prints `No memories found matching your query. No memories cleared the
+relevance floor: …`.
 
-The defaults were measured on the frozen bench corpus: 45 of 48 off-topic
-queries return nothing, and gold-set recall@5 moves from 0.9613 to 0.9774.
-[`../recall-floor.md`](../recall-floor.md) has the distributions, the
-trade-off curve and the scripts.
+The defaults were measured on the frozen bench corpus. 45 of 48 off-topic
+queries return nothing. Gold-set recall@5 rises from 0.9613 to 0.9774 on the
+gold hooks and falls from 0.9480 to 0.9337 on model-written queries. Short
+ordinary chat prompts such as "run the tests" are not filtered: 1 of 64
+returns nothing. [`../recall-floor.md`](../recall-floor.md) has the
+distributions, the trade-off curve, that open question and the scripts.
 
 ### Deviations
 

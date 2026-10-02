@@ -1,7 +1,7 @@
 /**
  * LAB-426 measurement: raw recall signals on the frozen bench corpus.
  *
- * For every gold-set hook, model query and negative query it replays the
+ * For every gold-set hook, model query, negative query and extra-set query it replays the
  * backend's hybrid ranking (same SQL, plus the gold item's created_at cutoff)
  * and records cosine similarity and the full-text signals of every fused
  * candidate and of every gold memory. Output is one JSON file that
@@ -10,7 +10,10 @@
  * Usage (from ts/):
  *   RECALL_FLOOR_POSTGRES_URL=postgres://memorygraph@127.0.0.1:55426/memorygraph \
  *   MEMORY_POSTGRES_PASSWORD=... MEMORY_EMBED_URL=http://127.0.0.1:11434 \
- *   bun run tests/recall-floor/measure.ts <homelab docs/bench/memory dir> <negative-queries.jsonl> <out.json>
+ *   bun run tests/recall-floor/measure.ts <homelab docs/bench/memory dir> <negative-queries.jsonl> <out.json> [extra-set.jsonl ...]
+ *
+ * Each extra file is a query set with no gold memories (ordinary-prompts.jsonl,
+ * keyword-queries.jsonl); its rows name their own set.
  *
  * Refuses any Postgres host that is not loopback.
  */
@@ -33,7 +36,7 @@ export function assertLoopback(url: string): void {
 }
 
 interface QueryCase {
-  set: "gold" | "model" | "negative";
+  set: "gold" | "model" | "negative" | "ordinary" | "keyword";
   id: string;
   query: string;
   cutoff: string;
@@ -48,7 +51,7 @@ function jsonl(path: string): Record<string, unknown>[] {
     .map((l) => JSON.parse(l));
 }
 
-function loadCases(benchDir: string, negativesPath: string): QueryCase[] {
+function loadCases(benchDir: string, negativesPath: string, extraPaths: string[]): QueryCase[] {
   const gold = jsonl(join(benchDir, "goldset.jsonl"));
   const byId = new Map(gold.map((g) => [g["id"] as string, g]));
   const cases: QueryCase[] = gold.map((g) => ({
@@ -81,14 +84,24 @@ function loadCases(benchDir: string, negativesPath: string): QueryCase[] {
       kind: n["kind"] as string,
     });
   }
+  for (const o of extraPaths.flatMap(jsonl)) {
+    cases.push({
+      set: o["set"] as QueryCase["set"],
+      id: o["id"] as string,
+      query: o["query"] as string,
+      cutoff: FAR_FUTURE,
+      gold_ids: [],
+      kind: o["kind"] as string,
+    });
+  }
   return cases;
 }
 
 async function main(): Promise<void> {
-  const [benchDir, negativesPath, outPath] = process.argv.slice(2);
+  const [benchDir, negativesPath, outPath, ...extraPaths] = process.argv.slice(2);
   const url = process.env.RECALL_FLOOR_POSTGRES_URL;
   if (!benchDir || !negativesPath || !outPath || !url) {
-    console.error("usage: RECALL_FLOOR_POSTGRES_URL=... bun run tests/recall-floor/measure.ts <bench-dir> <negatives.jsonl> <out.json>");
+    console.error("usage: RECALL_FLOOR_POSTGRES_URL=... bun run tests/recall-floor/measure.ts <bench-dir> <negatives.jsonl> <out.json> [extra-set.jsonl ...]");
     process.exit(2);
   }
   assertLoopback(url);
@@ -101,7 +114,7 @@ async function main(): Promise<void> {
   const [count] = await sql`SELECT count(*)::int AS n, count(embedding)::int AS e FROM memories`;
 
   const out: unknown[] = [];
-  for (const c of loadCases(benchDir, negativesPath)) {
+  for (const c of loadCases(benchDir, negativesPath, extraPaths)) {
     const [vector] = await embedder.embed([queryEmbedText(c.query)]);
     const vec = vectorLiteral(vector!);
     const tsq = buildTsquery(c.query, " | ");
@@ -147,8 +160,8 @@ async function main(): Promise<void> {
               CASE WHEN q.tsq IS NULL THEN 0 ELSE ts_rank_cd(m.search_vector, q.tsq) END AS ts_rank_cd,
               cardinality(q.lex) AS query_lexemes,
               (SELECT count(*)::int FROM df WHERE m.search_vector @@ quote_literal(df.lexeme)::tsquery) AS matched,
-              coalesce((SELECT sum(df.idf) FROM df WHERE m.search_vector @@ quote_literal(df.lexeme)::tsquery), 0)
-                / nullif((SELECT sum(df.idf) FROM df), 0) AS idf_coverage
+              coalesce((SELECT sum(df.idf) FROM df WHERE m.search_vector @@ quote_literal(df.lexeme)::tsquery), 0) AS idf_matched,
+              coalesce((SELECT sum(df.idf) FROM df), 0) AS idf_total
        FROM memories m, q WHERE m.id = ANY($4::text[])`,
       [vec, lexemeText, tsq, ids, c.cutoff] as never[]
     );
@@ -170,7 +183,9 @@ async function main(): Promise<void> {
         query_lexemes: lex,
         matched,
         coverage: lex > 0 ? matched / lex : 0,
-        idf_coverage: Number(s?.["idf_coverage"] ?? 0),
+        idf_matched: Number(s?.["idf_matched"] ?? 0),
+        idf_total: Number(s?.["idf_total"] ?? 0),
+        idf_coverage: Number(s?.["idf_total"] ?? 0) > 0 ? Number(s?.["idf_matched"] ?? 0) / Number(s!["idf_total"]) : 0,
         before_cutoff: s ? Boolean(s["before_cutoff"]) : false,
       };
     };

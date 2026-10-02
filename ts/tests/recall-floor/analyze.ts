@@ -15,9 +15,11 @@ interface Row {
   ts_rank: number;
   coverage: number;
   idf_coverage: number;
+  idf_matched: number;
+  query_lexemes: number;
 }
 interface Case {
-  set: "gold" | "model" | "negative";
+  set: "gold" | "model" | "negative" | "ordinary" | "keyword";
   id: string;
   kind?: string;
   query: string;
@@ -55,7 +57,7 @@ function evaluate(cases: Case[], keep: (r: Row) => boolean, fulltextOnly = false
   };
   const survivors = (c: Case) => c.fused.filter((r) => keep(r) && (!fulltextOnly || r.ft_pos !== null)).length;
   const negatives = cases.filter((c) => c.set === "negative").map(survivors);
-  const abstain = cases.filter((c) => c.set !== "negative" && c.gold_ids.length === 0).map(survivors);
+  const abstain = cases.filter((c) => (c.set === "gold" || c.set === "model") && c.gold_ids.length === 0).map(survivors);
   return {
     hook: mean("gold"),
     model: mean("model"),
@@ -140,6 +142,73 @@ const ftBase = evaluate(cases, () => true, true);
 header("coverage floor");
 console.log(line("0 (no floor)", ftBase, ftBase));
 for (const f of [0.3, 0.4, 0.5, 0.6]) console.log(line(f.toFixed(2), evaluate(cases, (r) => r.idf_coverage >= f, true), ftBase));
+
+const ordinary = cases.filter((c) => c.set === "ordinary");
+const keyword = cases.filter((c) => c.set === "keyword");
+if (ordinary.length > 0) {
+  // Match weight: matched IDF mass in units of the IDF of a lexeme found in exactly one memory.
+  const unit = Math.log(1 + (data.memories - 0.5) / 1.5);
+  const weight = (r: Row) => r.idf_matched / unit;
+  const zero = (set: Case[], keep: (r: Row) => boolean) => set.filter((c) => !c.fused.some(keep)).length;
+  const full = (set: Case[], keep: (r: Row) => boolean) => set.filter((c) => c.fused.filter(keep).length >= 5).length;
+  const share = (n: number, d: number) => `${n}/${d} (${d ? ((100 * n) / d).toFixed(0) : 0}%)`;
+
+  console.log("\n### Ordinary session prompts: signals\n");
+  console.log(`| population | n | ${PCTS.map((p) => (p === 0 ? "min" : p === 1 ? "max" : `p${Math.round(p * 100)}`)).join(" | ")} |`);
+  console.log(`|---|---|${PCTS.map(() => "---").join("|")}|`);
+  const lexemes = (set: Case[]) => set.filter((c) => c.fused.length > 0).map((c) => c.fused[0]!.query_lexemes);
+  const best = (set: Case[], f: (r: Row) => number) => set.filter((c) => c.fused.length > 0).map((c) => Math.max(...c.fused.map(f)));
+  const positives = [...sets.gold, ...sets.model];
+  const goldRows = positives.flatMap((c) => c.gold);
+  const table: Array<[string, number[]]> = [
+    ["query lexemes, ordinary prompts", lexemes(ordinary)],
+    ["query lexemes, gold hooks and model queries", lexemes(positives)],
+    ["best cosine per ordinary prompt", best(ordinary, (r) => r.sim ?? 0)],
+    ["best IDF-weighted coverage per ordinary prompt", best(ordinary, (r) => r.idf_coverage)],
+    ["best match weight per ordinary prompt", best(ordinary, weight)],
+    ["match weight, gold memories", goldRows.map(weight)],
+    ["best match weight per negative query", best(sets.negative, weight)],
+    ["best match weight per keyword query", best(keyword, weight)],
+    ["best cosine per keyword query", best(keyword, (r) => r.sim ?? 0)],
+  ];
+  for (const [name, xs] of table) console.log(`| ${name} | ${xs.length} | ${quantiles(xs)} |`);
+
+  console.log("\n### Ordinary session prompts: candidate rules\n");
+  console.log("W is a minimum match weight on every candidate, G a minimum cosine on the coverage arm.");
+  console.log("A candidate passes when cosine >= 0.66, or weight >= W and (cosine >= 0.58 or (coverage >= 0.5 and cosine >= G)).\n");
+  console.log("| rule | recall@5 hooks (pp) | recall@5 model queries (pp) | negatives returning 0 | ordinary returning 0 | ordinary returning a full page | keyword queries returning 0 | both targets | ordinary >= 80% |");
+  console.log("|---|---|---|---|---|---|---|---|---|");
+  const ruleLine = (label: string, keep: (r: Row) => boolean) => {
+    const e = evaluate(cases, keep);
+    const targets = e.negZero / e.negTotal >= 0.9 && e.negFull === 0 && e.hook >= base.hook - 0.02 && e.model >= base.model - 0.02;
+    const oz = zero(ordinary, keep);
+    console.log(
+      `| ${label} | ${e.hook.toFixed(4)} (${pp(e.hook, base.hook)}) | ${e.model.toFixed(4)} (${pp(e.model, base.model)}) | ${share(e.negZero, e.negTotal)} | ` +
+        `${share(oz, ordinary.length)} | ${full(ordinary, keep)} | ${share(zero(keyword, keep), keyword.length)} | ${targets ? "yes" : "no"} | ${oz / ordinary.length >= 0.8 ? "yes" : "no"} |`
+    );
+  };
+  const current = (r: Row) => (r.sim ?? 0) >= 0.58 || r.idf_coverage >= 0.5;
+  ruleLine("no floor", () => true);
+  ruleLine("current: cosine >= 0.58 or coverage >= 0.5", current);
+  ruleLine("coverage arm needs >= 4 query lexemes", (r) => (r.sim ?? 0) >= 0.58 || (r.idf_coverage >= 0.5 && r.query_lexemes >= 4));
+  ruleLine("coverage arm needs cosine >= 0.50", (r) => (r.sim ?? 0) >= 0.58 || (r.idf_coverage >= 0.5 && (r.sim ?? 0) >= 0.5));
+  ruleLine("coverage arm needs weight >= 0.85", (r) => (r.sim ?? 0) >= 0.58 || (r.idf_coverage >= 0.5 && weight(r) >= 0.85));
+  for (const w of [0.4, 0.5, 0.55, 0.6, 0.7, 0.8]) {
+    for (const g of [0, 0.45, 0.48, 0.5, 0.52]) {
+      ruleLine(`W ${w.toFixed(2)}, G ${g.toFixed(2)}`, (r) => (r.sim ?? 0) >= 0.66 || (weight(r) >= w && ((r.sim ?? 0) >= 0.58 || (r.idf_coverage >= 0.5 && (r.sim ?? 0) >= g))));
+    }
+  }
+
+  console.log("\n### Ordinary session prompts under the current rule\n");
+  console.log("| id | kind | lexemes | results (of up to 100 candidates) | best cosine | best coverage | prompt |");
+  console.log("|---|---|---|---|---|---|---|");
+  for (const c of ordinary) {
+    console.log(
+      `| ${c.id} | ${c.kind} | ${c.fused[0]?.query_lexemes ?? 0} | ${c.fused.filter(current).length} | ` +
+        `${Math.max(0, ...c.fused.map((r) => r.sim ?? 0)).toFixed(3)} | ${Math.max(0, ...c.fused.map((r) => r.idf_coverage)).toFixed(2)} | ${c.query} |`
+    );
+  }
+}
 
 console.log("\n### Negative queries\n");
 console.log("| id | kind | best cosine | best IDF-weighted coverage | query |");

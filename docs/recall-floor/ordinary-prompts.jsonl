@@ -1,0 +1,64 @@
+{"id": "ord-01", "set": "ordinary", "kind": "acknowledgement", "query": "continue"}
+{"id": "ord-02", "set": "ordinary", "kind": "acknowledgement", "query": "yes"}
+{"id": "ord-03", "set": "ordinary", "kind": "acknowledgement", "query": "ok"}
+{"id": "ord-04", "set": "ordinary", "kind": "acknowledgement", "query": "go ahead"}
+{"id": "ord-05", "set": "ordinary", "kind": "acknowledgement", "query": "ok land it"}
+{"id": "ord-06", "set": "ordinary", "kind": "acknowledgement", "query": "yes do that"}
+{"id": "ord-07", "set": "ordinary", "kind": "acknowledgement", "query": "sounds good"}
+{"id": "ord-08", "set": "ordinary", "kind": "acknowledgement", "query": "looks good to me"}
+{"id": "ord-09", "set": "ordinary", "kind": "acknowledgement", "query": "thanks"}
+{"id": "ord-10", "set": "ordinary", "kind": "acknowledgement", "query": "try again"}
+{"id": "ord-11", "set": "ordinary", "kind": "acknowledgement", "query": "keep going"}
+{"id": "ord-12", "set": "ordinary", "kind": "acknowledgement", "query": "do it"}
+{"id": "ord-13", "set": "ordinary", "kind": "acknowledgement", "query": "no, undo that"}
+{"id": "ord-14", "set": "ordinary", "kind": "acknowledgement", "query": "stop"}
+{"id": "ord-15", "set": "ordinary", "kind": "acknowledgement", "query": "never mind"}
+{"id": "ord-16", "set": "ordinary", "kind": "acknowledgement", "query": "next"}
+{"id": "ord-17", "set": "ordinary", "kind": "command", "query": "run the tests"}
+{"id": "ord-18", "set": "ordinary", "kind": "command", "query": "commit this"}
+{"id": "ord-19", "set": "ordinary", "kind": "command", "query": "fix the lint error"}
+{"id": "ord-20", "set": "ordinary", "kind": "command", "query": "push it"}
+{"id": "ord-21", "set": "ordinary", "kind": "command", "query": "open a pull request"}
+{"id": "ord-22", "set": "ordinary", "kind": "command", "query": "run the build"}
+{"id": "ord-23", "set": "ordinary", "kind": "command", "query": "rerun the failing test"}
+{"id": "ord-24", "set": "ordinary", "kind": "command", "query": "format the code"}
+{"id": "ord-25", "set": "ordinary", "kind": "command", "query": "revert the last change"}
+{"id": "ord-26", "set": "ordinary", "kind": "command", "query": "commit and push"}
+{"id": "ord-27", "set": "ordinary", "kind": "command", "query": "write a commit message"}
+{"id": "ord-28", "set": "ordinary", "kind": "command", "query": "rebase on main"}
+{"id": "ord-29", "set": "ordinary", "kind": "command", "query": "merge it"}
+{"id": "ord-30", "set": "ordinary", "kind": "command", "query": "add a test for that"}
+{"id": "ord-31", "set": "ordinary", "kind": "command", "query": "update the readme"}
+{"id": "ord-32", "set": "ordinary", "kind": "command", "query": "clean up the code"}
+{"id": "ord-33", "set": "ordinary", "kind": "command", "query": "rename that variable"}
+{"id": "ord-34", "set": "ordinary", "kind": "command", "query": "remove the unused imports"}
+{"id": "ord-35", "set": "ordinary", "kind": "command", "query": "run it again with verbose output"}
+{"id": "ord-36", "set": "ordinary", "kind": "command", "query": "make the tests pass"}
+{"id": "ord-37", "set": "ordinary", "kind": "command", "query": "install the dependencies"}
+{"id": "ord-38", "set": "ordinary", "kind": "command", "query": "start the dev server"}
+{"id": "ord-39", "set": "ordinary", "kind": "command", "query": "check the logs"}
+{"id": "ord-40", "set": "ordinary", "kind": "command", "query": "fix the type errors"}
+{"id": "ord-41", "set": "ordinary", "kind": "command", "query": "apply the same change to the other file"}
+{"id": "ord-42", "set": "ordinary", "kind": "question", "query": "what's next?"}
+{"id": "ord-43", "set": "ordinary", "kind": "question", "query": "why did that fail?"}
+{"id": "ord-44", "set": "ordinary", "kind": "question", "query": "can you explain that?"}
+{"id": "ord-45", "set": "ordinary", "kind": "question", "query": "show me the diff"}
+{"id": "ord-46", "set": "ordinary", "kind": "question", "query": "what changed?"}
+{"id": "ord-47", "set": "ordinary", "kind": "question", "query": "is it done?"}
+{"id": "ord-48", "set": "ordinary", "kind": "question", "query": "what does this function do?"}
+{"id": "ord-49", "set": "ordinary", "kind": "question", "query": "how long will that take?"}
+{"id": "ord-50", "set": "ordinary", "kind": "question", "query": "summarize what you changed so far"}
+{"id": "ord-51", "set": "ordinary", "kind": "question", "query": "what are the options here?"}
+{"id": "ord-52", "set": "ordinary", "kind": "question", "query": "which files did you touch?"}
+{"id": "ord-53", "set": "ordinary", "kind": "question", "query": "did the tests pass?"}
+{"id": "ord-54", "set": "ordinary", "kind": "question", "query": "can you make it shorter?"}
+{"id": "ord-55", "set": "ordinary", "kind": "question", "query": "what is the status?"}
+{"id": "ord-56", "set": "ordinary", "kind": "question", "query": "are you sure that is right?"}
+{"id": "ord-57", "set": "ordinary", "kind": "question", "query": "where is that defined?"}
+{"id": "ord-58", "set": "ordinary", "kind": "question", "query": "what do you recommend?"}
+{"id": "ord-59", "set": "ordinary", "kind": "question", "query": "explain the error"}
+{"id": "ord-60", "set": "ordinary", "kind": "question", "query": "list the open todos"}
+{"id": "ord-61", "set": "ordinary", "kind": "question", "query": "read the file and tell me what it does"}
+{"id": "ord-62", "set": "ordinary", "kind": "question", "query": "give me a summary of this conversation"}
+{"id": "ord-63", "set": "ordinary", "kind": "question", "query": "what should we do first?"}
+{"id": "ord-64", "set": "ordinary", "kind": "question", "query": "does this look right to you?"}

@@ -19,6 +19,20 @@ export interface HealthCheckResult {
   [key: string]: unknown;
 }
 
+/** What the relevance floor did to one recall. */
+export interface RecallFloorReport {
+  candidates: number;
+  dropped: number;
+  similarityFloor: number | null;
+  fulltextFloor: number;
+}
+
+/** A recall's memories with its floor report; `floor` is null on backends without a floor. */
+export interface RecallResult {
+  memories: Memory[];
+  floor: RecallFloorReport | null;
+}
+
 export interface GraphBackend {
   // Connection lifecycle
   connect(): Promise<boolean>;
@@ -79,6 +93,11 @@ export interface GraphBackend {
     query: string,
     opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
   ): Promise<Memory[]>;
+
+  recallWithFloor?(
+    query: string,
+    opts?: { memoryTypes?: string[]; projectPath?: string; limit?: number }
+  ): Promise<RecallResult>;
 
   // H7 temporal — minimal memory versioning (M5 / VAL-LOCAL-017..019).
   // Backends that implement these snapshot the prior memory state on

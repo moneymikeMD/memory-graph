@@ -11,11 +11,14 @@
  * Usage (from ts/):
  *   RECALL_FLOOR_POSTGRES_URL=postgres://memorygraph@127.0.0.1:55426/memorygraph \
  *   MEMORY_POSTGRES_PASSWORD=... MEMORY_EMBED_URL=http://127.0.0.1:11434 \
- *   bun run tests/recall-floor/evaluate.ts <homelab docs/bench/memory dir> <negative-queries.jsonl> [out.json]
+ *   bun run tests/recall-floor/evaluate.ts <homelab docs/bench/memory dir> <negative-queries.jsonl> [extra-set.jsonl ...]
+ *
+ * Extra sets (ordinary-prompts.jsonl, keyword-queries.jsonl) run against the
+ * whole corpus like the negatives and are counted per set.
  *
  * Refuses any Postgres host that is not loopback.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
@@ -36,16 +39,17 @@ interface Arm {
   name: string;
   backend: PostgresBackend;
   negativeCounts: number[];
+  extraCounts: Map<string, number[]>;
   recalls: { hook: number[]; model: number[] };
   abstainZero: number;
   abstainTotal: number;
 }
 
 async function main(): Promise<void> {
-  const [benchDir, negativesPath, outPath] = process.argv.slice(2);
+  const [benchDir, negativesPath, ...extraPaths] = process.argv.slice(2);
   const sourceUrl = process.env.RECALL_FLOOR_POSTGRES_URL;
   if (!benchDir || !negativesPath || !sourceUrl) {
-    console.error("usage: RECALL_FLOOR_POSTGRES_URL=... bun run tests/recall-floor/evaluate.ts <bench-dir> <negatives.jsonl> [out.json]");
+    console.error("usage: RECALL_FLOOR_POSTGRES_URL=... bun run tests/recall-floor/evaluate.ts <bench-dir> <negatives.jsonl> [extra-set.jsonl ...]");
     process.exit(2);
   }
   assertLoopback(sourceUrl);
@@ -66,6 +70,7 @@ async function main(): Promise<void> {
     name,
     backend: new PostgresBackend({ url: copy.toString(), password, embedder: emb, ...floors }),
     negativeCounts: [],
+    extraCounts: new Map(),
     recalls: { hook: [], model: [] },
     abstainZero: 0,
     abstainTotal: 0,
@@ -84,6 +89,14 @@ async function main(): Promise<void> {
     for (const n of jsonl(negativesPath)) {
       for (const a of arms) {
         a.negativeCounts.push((await a.backend.recallMemories(n["query"] as string, { limit: LIMIT })).length);
+      }
+    }
+
+    for (const e of extraPaths.flatMap(jsonl)) {
+      for (const a of arms) {
+        const counts = a.extraCounts.get(e["set"] as string) ?? [];
+        counts.push((await a.backend.recallMemories(e["query"] as string, { limit: LIMIT })).length);
+        a.extraCounts.set(e["set"] as string, counts);
       }
     }
 
@@ -138,7 +151,16 @@ async function main(): Promise<void> {
         `${s.recall_at_5_hook.toFixed(4)} | ${s.recall_at_5_model.toFixed(4)} | ${s.recall_at_5_all.toFixed(4)} | ${s.abstain_zero}/${s.abstain_queries} |`
     );
   }
-  if (outPath) writeFileSync(outPath, JSON.stringify({ limit: LIMIT, summary }, null, 1));
+  for (const set of arms[0]!.extraCounts.keys()) {
+    console.log(`
+| arm | ${set} queries returning 0 | ${set} queries returning a full page |`);
+    console.log("|---|---|---|");
+    for (const a of arms) {
+      const counts = a.extraCounts.get(set)!;
+      const zero = counts.filter((n) => n === 0).length;
+      console.log(`| ${a.name} | ${zero}/${counts.length} (${((100 * zero) / counts.length).toFixed(1)}%) | ${counts.filter((n) => n >= LIMIT).length}/${counts.length} |`);
+    }
+  }
 }
 
 if (import.meta.main) await main();
