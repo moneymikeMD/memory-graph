@@ -27,6 +27,7 @@ and a pgvector cosine ranking fused by reciprocal-rank fusion (k = 60).
 | `MEMORY_EMBED_DIGEST` | `ac6da0df…15621d` | The model digest the benchmark used. It is checked against each URL's `/api/tags` before that URL embeds anything in a process. |
 | `MEMORY_EMBED_DIMENSION` | `1024` | The model's output dimension, 1 to 4000 (pgvector's HNSW limit for `halfvec`). It must match the `embedding` column; see Changing the embedding model. |
 | `MEMORY_EMBED_TIMEOUT_MS` | `30000` | With one URL, the timeout for each HTTP request. With a list, the total for one embed across every URL tried. |
+| `MEMORY_EMBED_KEEP_ALIVE` | unset | Sent as `keep_alive` on every `/api/embed` request: seconds (`-1` pins the model) or a duration such as `30m`. Unset sends nothing, so the Ollama server default (5 minutes, or its `OLLAMA_KEEP_ALIVE`) applies. |
 | `MEMORY_EMBED_CONNECT_TIMEOUT_MS` | `250` | List only. TCP connect timeout for each URL, checked before any HTTP request. The default is a guess: ample for a 2 ms LAN, not measured against a sleeping host or a cold Tailscale path. |
 | `MEMORY_EMBED_BREAKER_MS` | `60000` | List only. How long a failed URL is skipped by every process. `0` disables the breaker. The default is a guess. |
 | `MEMORY_EMBED_BREAKER_PATH` | `<dir>/memorygraph-embed-breaker-<uid>.json` | List only. The breaker state file. `<dir>` is `$XDG_RUNTIME_DIR` on Linux when set, otherwise `os.tmpdir()` (per-user on macOS). |

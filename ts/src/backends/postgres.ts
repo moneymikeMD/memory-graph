@@ -139,6 +139,7 @@ export class PostgresBackend implements GraphBackend {
         connectTimeoutMs: Config.EMBED_CONNECT_TIMEOUT_MS,
         breakerMs: Config.EMBED_BREAKER_MS,
         breakerPath: Config.EMBED_BREAKER_PATH,
+        keepAlive: process.env.MEMORY_EMBED_KEEP_ALIVE,
       });
     this.duplicateThreshold =
       opts.duplicateThreshold ?? Config.DUPLICATE_THRESHOLD ?? DEFAULT_DUPLICATE_THRESHOLD;

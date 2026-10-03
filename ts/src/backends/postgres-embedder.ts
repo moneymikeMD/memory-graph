@@ -52,6 +52,8 @@ export interface EmbedderOptions {
   breakerPath?: string;
   /** A list only: how long a failed URL is skipped; 0 disables the breaker. */
   breakerMs?: number;
+  /** Ollama keep_alive for /api/embed: a duration such as "30m" or seconds, -1 to pin; unset sends none. */
+  keepAlive?: string;
   /** Opens the probe's TCP connection; replaceable so tests need no network. */
   connect?: SocketFactory;
 }
@@ -82,6 +84,13 @@ export function parseEmbedUrls(raw: string | undefined): string[] {
   return out;
 }
 
+/** Ollama takes keep_alive as a number of seconds (-1 pins) or a duration string; blank means none. */
+export function parseKeepAlive(raw: string | undefined): string | number | undefined {
+  const v = raw?.trim();
+  if (!v) return undefined;
+  return /^-?\d+$/.test(v) ? Number(v) : v;
+}
+
 export class OllamaEmbedder {
   readonly urls: string[];
   readonly model: string;
@@ -91,6 +100,7 @@ export class OllamaEmbedder {
   readonly connectTimeoutMs: number;
   readonly breakerMs: number;
   readonly breakerPath: string | undefined;
+  readonly keepAlive: string | number | undefined;
   private readonly multi: boolean;
   private readonly connect: SocketFactory;
   private active: string | null = null;
@@ -110,6 +120,7 @@ export class OllamaEmbedder {
     this.connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_EMBED_CONNECT_TIMEOUT_MS;
     this.breakerMs = Math.max(0, opts.breakerMs ?? DEFAULT_EMBED_BREAKER_MS);
     this.breakerPath = opts.breakerPath || undefined;
+    this.keepAlive = parseKeepAlive(opts.keepAlive);
     this.connect = opts.connect ?? ((target) => createConnection(target));
     if (this.urls.length === 0) this.unavailable = "MEMORY_EMBED_URL is not set";
   }
@@ -218,7 +229,11 @@ export class OllamaEmbedder {
   }
 
   private async embedAt(url: string, texts: string[], deadline: number): Promise<number[][]> {
-    const body = (await this.request(url, "/api/embed", deadline, { model: this.model, input: texts })) as {
+    const body = (await this.request(url, "/api/embed", deadline, {
+      model: this.model,
+      input: texts,
+      ...(this.keepAlive === undefined ? {} : { keep_alive: this.keepAlive }),
+    })) as {
       embeddings?: unknown;
     };
     const vectors = body.embeddings;
